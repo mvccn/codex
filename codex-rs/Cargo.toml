@@ -5,6 +5,7 @@ members = [
     "async-utils",
     "app-server",
     "app-server-protocol",
+    "app-server-ws",
     "apply-patch",
     "arg0",
     "feedback",
