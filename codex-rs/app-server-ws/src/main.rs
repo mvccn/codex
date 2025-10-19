@@ -21,6 +21,7 @@ use futures_util::sink::SinkExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -133,8 +134,22 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address {}: {e}", args.bind))?;
     info!("codex-app-server-ws listening on {addr}");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => info!(target: "codex-app-server-ws", "ctrl+c received; shutting down"),
+        Err(err) => warn!(
+            target: "codex-app-server-ws",
+            %err,
+            "failed to install ctrl+c handler"
+        ),
+    }
 }
 
 async fn ws_handler(
@@ -163,12 +178,17 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     // Forward server → client messages.
     let to_ws = tokio::spawn(async move {
         while let Some(value) = rx_json.recv().await {
-            let Ok(mut text) = serde_json::to_string(&value) else {
-                continue;
-            };
-            text.push('\n');
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                break;
+            match serde_json::to_string(&value) {
+                Ok(mut text) => {
+                    debug!(target: "codex-app-server-ws", payload = %text, "→ ws");
+                    text.push('\n');
+                    if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(target: "codex-app-server-ws", %err, "failed to serialize response");
+                }
             }
         }
     });
@@ -176,13 +196,18 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     // Forward client → server messages.
     while let Some(msg) = ws_rx.next().await {
         match msg {
-            Ok(Message::Text(text)) => match serde_json::from_str::<JSONRPCMessage>(&text) {
-                Ok(JSONRPCMessage::Request(req)) => conn.process_request(req).await,
-                Ok(JSONRPCMessage::Notification(n)) => conn.process_notification(n).await,
-                Ok(JSONRPCMessage::Response(resp)) => conn.process_response(resp).await,
-                Ok(JSONRPCMessage::Error(_)) => {}
-                Err(_) => {}
-            },
+            Ok(Message::Text(text)) => {
+                debug!(target: "codex-app-server-ws", payload = %text, "← ws");
+                match serde_json::from_str::<JSONRPCMessage>(&text) {
+                    Ok(JSONRPCMessage::Request(req)) => conn.process_request(req).await,
+                    Ok(JSONRPCMessage::Notification(n)) => conn.process_notification(n).await,
+                    Ok(JSONRPCMessage::Response(resp)) => conn.process_response(resp).await,
+                    Ok(JSONRPCMessage::Error(_)) => {}
+                    Err(err) => {
+                        warn!(target: "codex-app-server-ws", %err, "failed to parse incoming payload");
+                    }
+                }
+            }
             Ok(Message::Close(_)) => break,
             Ok(Message::Binary(_)) => {}
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
