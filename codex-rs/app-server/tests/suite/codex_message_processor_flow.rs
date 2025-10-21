@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use app_test_support::McpProcess;
 use app_test_support::create_final_assistant_message_sse_response;
@@ -372,6 +373,166 @@ async fn test_send_user_turn_changes_approval_policy_behavior() {
     .await
     .expect("task_complete 2 timeout")
     .expect("task_complete 2 notification");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_exec_approval_emitted_once_with_multiple_listeners() {
+    if env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tmp dir");
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home).expect("create codex home dir");
+    let working_directory = tmp.path().join("workdir");
+    std::fs::create_dir(&working_directory).expect("create working directory");
+
+    let responses = vec![
+        create_shell_sse_response(
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print(42)".to_string(),
+            ],
+            Some(&working_directory),
+            Some(5000),
+            "call1",
+        )
+        .expect("create shell response"),
+        create_final_assistant_message_sse_response("All done!")
+            .expect("create final assistant message"),
+    ];
+    let server = create_mock_chat_completions_server(responses).await;
+    create_config_toml(&codex_home, &server.uri()).expect("write config");
+
+    let mut mcp = McpProcess::new(&codex_home)
+        .await
+        .expect("spawn mcp process");
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize())
+        .await
+        .expect("init timeout")
+        .expect("init failed");
+
+    let new_conv_id = mcp
+        .send_new_conversation_request(NewConversationParams {
+            cwd: Some(working_directory.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("send newConversation");
+    let new_conv_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(new_conv_id)),
+    )
+    .await
+    .expect("newConversation timeout")
+    .expect("newConversation resp");
+    let NewConversationResponse {
+        conversation_id, ..
+    } = to_response::<NewConversationResponse>(new_conv_resp)
+        .expect("deserialize newConversation response");
+
+    let first_listener_id = mcp
+        .send_add_conversation_listener_request(AddConversationListenerParams { conversation_id })
+        .await
+        .expect("send first addConversationListener");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_listener_id)),
+    )
+    .await
+    .expect("first addConversationListener timeout")
+    .expect("first addConversationListener resp");
+
+    let second_listener_id = mcp
+        .send_add_conversation_listener_request(AddConversationListenerParams { conversation_id })
+        .await
+        .expect("send second addConversationListener");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_listener_id)),
+    )
+    .await
+    .expect("second addConversationListener timeout")
+    .expect("second addConversationListener resp");
+
+    let send_user_id = mcp
+        .send_send_user_message_request(SendUserMessageParams {
+            conversation_id,
+            items: vec![InputItem::Text {
+                text: "run python".to_string(),
+            }],
+        })
+        .await
+        .expect("send sendUserMessage");
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(send_user_id)),
+    )
+    .await
+    .expect("sendUserMessage timeout")
+    .expect("sendUserMessage resp");
+
+    let approval_request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await
+    .expect("waiting for exec approval request timeout")
+    .expect("exec approval request");
+    let (request_id, params) = match approval_request {
+        ServerRequest::ExecCommandApproval { request_id, params } => (request_id, params),
+        other => panic!("expected ExecCommandApproval request, got: {other:?}"),
+    };
+    assert_eq!(
+        ExecCommandApprovalParams {
+            conversation_id,
+            call_id: "call1".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print(42)".to_string(),
+            ],
+            cwd: working_directory.clone(),
+            reason: None,
+        },
+        params
+    );
+
+    mcp.send_response(
+        request_id,
+        serde_json::json!({ "decision": codex_core::protocol::ReviewDecision::Approved }),
+    )
+    .await
+    .expect("send approval response");
+
+    let _ = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+    )
+    .await
+    .expect("task_complete timeout")
+    .expect("task_complete notification");
+
+    match tokio::time::timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_request_message(),
+    )
+    .await
+    {
+        Ok(Ok(extra)) => {
+            panic!("unexpected additional server request: {extra:?}");
+        }
+        Ok(Err(err)) => {
+            panic!("failed while waiting for additional request: {err:?}");
+        }
+        Err(_) => {
+            // expected: no additional request observed within timeout.
+        }
+    }
 }
 
 // Helper: minimal config.toml pointing at mock provider.

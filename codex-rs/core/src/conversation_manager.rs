@@ -20,7 +20,13 @@ use codex_protocol::protocol::SessionSource;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
+use tokio::sync::oneshot;
+use tracing::warn;
+
+const CONVERSATION_EVENT_BUFFER: usize = 128;
 
 /// Represents a newly created Codex conversation, including the first event
 /// (which is [`EventMsg::SessionConfigured`]).
@@ -36,6 +42,7 @@ pub struct ConversationManager {
     conversations: Arc<RwLock<HashMap<ConversationId, Arc<CodexConversation>>>>,
     auth_manager: Arc<AuthManager>,
     session_source: SessionSource,
+    event_dispatchers: Arc<RwLock<HashMap<ConversationId, Arc<ConversationEventDispatcher>>>>,
 }
 
 impl ConversationManager {
@@ -44,6 +51,7 @@ impl ConversationManager {
             conversations: Arc::new(RwLock::new(HashMap::new())),
             auth_manager,
             session_source,
+            event_dispatchers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -122,6 +130,23 @@ impl ConversationManager {
             .ok_or_else(|| CodexErr::ConversationNotFound(conversation_id))
     }
 
+    pub async fn subscribe_events(
+        &self,
+        conversation_id: ConversationId,
+    ) -> CodexResult<(Arc<CodexConversation>, broadcast::Receiver<Event>)> {
+        let conversation = self.get_conversation(conversation_id).await?;
+        let dispatcher = {
+            let mut dispatchers = self.event_dispatchers.write().await;
+            dispatchers
+                .entry(conversation_id)
+                .or_insert_with(|| {
+                    ConversationEventDispatcher::start(conversation_id, conversation.clone())
+                })
+                .clone()
+        };
+        Ok((conversation, dispatcher.subscribe()))
+    }
+
     pub async fn resume_conversation_from_rollout(
         &self,
         config: Config,
@@ -144,7 +169,18 @@ impl ConversationManager {
         &self,
         conversation_id: &ConversationId,
     ) -> Option<Arc<CodexConversation>> {
-        self.conversations.write().await.remove(conversation_id)
+        let mut conversations = self.conversations.write().await;
+        let removed = conversations.remove(conversation_id);
+        drop(conversations);
+
+        if removed.is_some() {
+            let mut dispatchers = self.event_dispatchers.write().await;
+            if let Some(dispatcher) = dispatchers.remove(conversation_id) {
+                dispatcher.shutdown().await;
+            }
+        }
+
+        removed
     }
 
     /// Fork an existing conversation by taking messages up to the given position
@@ -169,6 +205,60 @@ impl ConversationManager {
         } = Codex::spawn(config, auth_manager, history, self.session_source).await?;
 
         self.finalize_spawn(codex, conversation_id).await
+    }
+}
+
+/// Broadcasts events from a single [`CodexConversation`] to multiple subscribers.
+struct ConversationEventDispatcher {
+    sender: broadcast::Sender<Event>,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl ConversationEventDispatcher {
+    fn start(conversation_id: ConversationId, conversation: Arc<CodexConversation>) -> Arc<Self> {
+        let (sender, _) = broadcast::channel(CONVERSATION_EVENT_BUFFER);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let sender_clone = sender.clone();
+        let conversation_id_str = conversation_id.to_string();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    event = conversation.next_event() => {
+                        match event {
+                            Ok(event) => {
+                                // Ignore send errors when no subscribers are attached.
+                                let _ = sender_clone.send(event);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    conversation_id = %conversation_id_str,
+                                    %err,
+                                    "conversation.next_event() failed in dispatcher"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Arc::new(Self {
+            sender,
+            shutdown: Mutex::new(Some(shutdown_tx)),
+        })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.sender.subscribe()
+    }
+
+    async fn shutdown(&self) {
+        if let Some(tx) = self.shutdown.lock().await.take() {
+            let _ = tx.send(());
+        }
     }
 }
 

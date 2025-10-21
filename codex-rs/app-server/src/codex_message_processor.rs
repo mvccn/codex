@@ -105,6 +105,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tracing::error;
 use tracing::info;
@@ -124,6 +125,12 @@ impl ActiveLogin {
     }
 }
 
+struct ListenerRegistration {
+    cancel: oneshot::Sender<()>,
+    conversation_id: ConversationId,
+    is_primary: Arc<AtomicBool>,
+}
+
 /// Handles JSON-RPC messages for Codex conversations.
 pub(crate) struct CodexMessageProcessor {
     auth_manager: Arc<AuthManager>,
@@ -131,7 +138,7 @@ pub(crate) struct CodexMessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     codex_linux_sandbox_exe: Option<PathBuf>,
     config: Arc<Config>,
-    conversation_listeners: HashMap<Uuid, oneshot::Sender<()>>,
+    conversation_listeners: HashMap<Uuid, ListenerRegistration>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     // Queue of pending interrupt requests per conversation. We reply when TurnAborted arrives.
     pending_interrupts: Arc<Mutex<HashMap<ConversationId, Vec<RequestId>>>>,
@@ -1272,46 +1279,67 @@ impl CodexMessageProcessor {
         params: AddConversationListenerParams,
     ) {
         let AddConversationListenerParams { conversation_id } = params;
-        let Ok(conversation) = self
+        let (conversation, mut events_rx) = match self
             .conversation_manager
-            .get_conversation(conversation_id)
+            .subscribe_events(conversation_id)
             .await
-        else {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: format!("conversation not found: {conversation_id}"),
-                data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: format!("conversation not found: {conversation_id}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
         };
-
         let subscription_id = Uuid::new_v4();
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        self.conversation_listeners
-            .insert(subscription_id, cancel_tx);
+        let is_primary = Arc::new(AtomicBool::new(false));
+        let has_primary = self.conversation_listeners.values().any(|registration| {
+            registration.conversation_id == conversation_id
+                && registration.is_primary.load(Ordering::Relaxed)
+        });
+        if !has_primary {
+            is_primary.store(true, Ordering::Relaxed);
+        }
+        self.conversation_listeners.insert(
+            subscription_id,
+            ListenerRegistration {
+                cancel: cancel_tx,
+                conversation_id,
+                is_primary: is_primary.clone(),
+            },
+        );
         let outgoing_for_task = self.outgoing.clone();
         let pending_interrupts = self.pending_interrupts.clone();
+        let conversation_for_task = conversation.clone();
+        let is_primary_for_task = is_primary.clone();
+        let conversation_id_for_task = conversation_id;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = &mut cancel_rx => {
-                        // User has unsubscribed, so exit this task.
                         break;
                     }
-                    event = conversation.next_event() => {
+                    event = events_rx.recv() => {
                         let event = match event {
                             Ok(event) => event,
-                            Err(err) => {
-                                tracing::warn!("conversation.next_event() failed with: {err}");
+                            Err(RecvError::Lagged(skipped)) => {
+                                warn!(
+                                    conversation_id = %conversation_id_for_task,
+                                    skipped = skipped,
+                                    "conversation listener lagged; dropped events"
+                                );
+                                continue;
+                            }
+                            Err(RecvError::Closed) => {
                                 break;
                             }
                         };
 
-                        // For now, we send a notification for every event,
-                        // JSON-serializing the `Event` as-is, but these should
-                        // be migrated to be variants of `ServerNotification`
-                        // instead.
                         let method = format!("codex/event/{}", event.msg);
                         let mut params = match serde_json::to_value(event.clone()) {
                             Ok(serde_json::Value::Object(map)) => map,
@@ -1324,15 +1352,28 @@ impl CodexMessageProcessor {
                                 continue;
                             }
                         };
-                        params.insert("conversationId".to_string(), conversation_id.to_string().into());
+                        params.insert(
+                            "conversationId".to_string(),
+                            conversation_id_for_task.to_string().into(),
+                        );
 
-                        outgoing_for_task.send_notification(OutgoingNotification {
-                            method,
-                            params: Some(params.into()),
-                        })
-                        .await;
+                        outgoing_for_task
+                            .send_notification(OutgoingNotification {
+                                method,
+                                params: Some(params.into()),
+                            })
+                            .await;
 
-                        apply_bespoke_event_handling(event.clone(), conversation_id, conversation.clone(), outgoing_for_task.clone(), pending_interrupts.clone()).await;
+                        if is_primary_for_task.load(Ordering::Relaxed) {
+                            apply_bespoke_event_handling(
+                                event.clone(),
+                                conversation_id_for_task,
+                                conversation_for_task.clone(),
+                                outgoing_for_task.clone(),
+                                pending_interrupts.clone(),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -1348,9 +1389,11 @@ impl CodexMessageProcessor {
     ) {
         let RemoveConversationListenerParams { subscription_id } = params;
         match self.conversation_listeners.remove(&subscription_id) {
-            Some(sender) => {
-                // Signal the spawned task to exit and acknowledge.
-                let _ = sender.send(());
+            Some(registration) => {
+                registration.is_primary.store(false, Ordering::Relaxed);
+                let conversation_id = registration.conversation_id;
+                let _ = registration.cancel.send(());
+                self.promote_next_primary_listener(conversation_id);
                 let response = RemoveConversationSubscriptionResponse {};
                 self.outgoing.send_response(request_id, response).await;
             }
@@ -1361,6 +1404,22 @@ impl CodexMessageProcessor {
                     data: None,
                 };
                 self.outgoing.send_error(request_id, error).await;
+            }
+        }
+    }
+
+    fn promote_next_primary_listener(&self, conversation_id: ConversationId) {
+        let has_primary = self.conversation_listeners.values().any(|registration| {
+            registration.conversation_id == conversation_id
+                && registration.is_primary.load(Ordering::Relaxed)
+        });
+        if has_primary {
+            return;
+        }
+        for registration in self.conversation_listeners.values() {
+            if registration.conversation_id == conversation_id {
+                registration.is_primary.store(true, Ordering::Relaxed);
+                break;
             }
         }
     }

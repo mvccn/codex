@@ -227,7 +227,13 @@ mod tests {
     use axum::Router;
     use serde_json::json;
     use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    type TestWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     async fn spawn_server(state: AppState) -> SocketAddr {
         let app: Router = Router::new()
@@ -239,6 +245,29 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr
+    }
+
+    async fn wait_for_method(ws: &mut TestWsStream, method: &str, attempts: usize) -> bool {
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+
+        for _ in 0..attempts {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(WsMsg::Text(txt)))) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+                        && v.get("method").and_then(|m| m.as_str()) == Some(method)
+                    {
+                        return true;
+                    }
+                }
+                Ok(Some(Ok(WsMsg::Close(_)))) => return false,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) => return false,
+                Ok(None) => return false,
+                Err(_) => continue,
+            }
+        }
+        false
     }
 
     #[tokio::test]
@@ -268,7 +297,6 @@ mod tests {
             "id": 1,
             "params": { "clientInfo": { "name": "tests", "version": "0.0.0" } }
         });
-        use tokio_tungstenite::tungstenite::Message as WsMsg;
         ws.send(WsMsg::Text(init.to_string().into())).await.unwrap();
 
         // newConversation
@@ -354,7 +382,6 @@ mod tests {
         // Connect WS and initialize
         let url = format!("ws://{addr}/ws");
         let (mut ws, _resp) = connect_async(url).await.unwrap();
-        use tokio_tungstenite::tungstenite::Message as WsMsg;
         let init = json!({
             "method": "initialize",
             "id": 1,
@@ -486,5 +513,182 @@ mod tests {
             saw_activity,
             "expected activity (task_started/agent_message/task_complete)"
         );
+    }
+
+    #[tokio::test]
+    async fn ws_multiple_listeners_receive_task_complete() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let overrides_cli = CliConfigOverrides {
+            raw_overrides: vec![],
+        };
+        let cli_overrides = overrides_cli.parse_overrides().unwrap();
+        let config = Config::load_with_cli_overrides(cli_overrides, ConfigOverrides::default())
+            .await
+            .expect("load config");
+        let engine = AppServerEngine::new(Arc::new(config), None);
+        let state = AppState {
+            auth_token: None,
+            engine,
+        };
+        let addr = spawn_server(state).await;
+        let url = format!("ws://{addr}/ws");
+
+        let (mut ws1, _resp1) = connect_async(&url).await.unwrap();
+        let init1 = json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": { "name": "tests", "version": "0.0.0" } }
+        });
+        ws1.send(WsMsg::Text(init1.to_string().into()))
+            .await
+            .unwrap();
+
+        let new_conv = json!({
+            "method": "newConversation",
+            "id": 2,
+            "params": { "cwd": tmp.path().to_string_lossy() }
+        });
+        ws1.send(WsMsg::Text(new_conv.to_string().into()))
+            .await
+            .unwrap();
+
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+        let mut conversation_id: Option<String> = None;
+        let mut ws1_task_complete_early = false;
+        for _ in 0..50 {
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                timeout(Duration::from_millis(200), ws1.next()).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+            {
+                if v.get("id").and_then(serde_json::Value::as_i64) == Some(2) {
+                    conversation_id = v
+                        .get("result")
+                        .and_then(|r| r.get("conversationId"))
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string);
+                    break;
+                }
+                if v.get("method").and_then(|m| m.as_str()) == Some("codex/event/task_complete") {
+                    ws1_task_complete_early = true;
+                }
+            }
+        }
+        let conversation_id = conversation_id.expect("conversationId");
+
+        let subscribe1 = json!({
+            "method": "addConversationListener",
+            "id": 3,
+            "params": { "conversationId": conversation_id }
+        });
+        ws1.send(WsMsg::Text(subscribe1.to_string().into()))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                timeout(Duration::from_millis(200), ws1.next()).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+            {
+                if v.get("id").and_then(serde_json::Value::as_i64) == Some(3) {
+                    break;
+                }
+                if v.get("method").and_then(|m| m.as_str()) == Some("codex/event/task_complete") {
+                    ws1_task_complete_early = true;
+                }
+            }
+        }
+
+        let (mut ws2, _resp2) = connect_async(&url).await.unwrap();
+        let init2 = json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": { "name": "tests", "version": "0.0.0" } }
+        });
+        ws2.send(WsMsg::Text(init2.to_string().into()))
+            .await
+            .unwrap();
+
+        let subscribe2 = json!({
+            "method": "addConversationListener",
+            "id": 2,
+            "params": { "conversationId": conversation_id }
+        });
+        ws2.send(WsMsg::Text(subscribe2.to_string().into()))
+            .await
+            .unwrap();
+        let mut ws2_task_complete_early = false;
+        for _ in 0..50 {
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                timeout(Duration::from_millis(200), ws2.next()).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+            {
+                if v.get("id").and_then(serde_json::Value::as_i64) == Some(2) {
+                    break;
+                }
+                if v.get("method").and_then(|m| m.as_str()) == Some("codex/event/task_complete") {
+                    ws2_task_complete_early = true;
+                }
+            }
+        }
+
+        use codex_app_server_protocol::InputItem as RpcInputItem;
+        use codex_app_server_protocol::JSONRPCMessage as RpcMessage;
+        use codex_app_server_protocol::JSONRPCRequest as RpcRequest;
+        use codex_app_server_protocol::RequestId as RpcRequestId;
+        use codex_app_server_protocol::SendUserTurnParams as RpcSendUserTurnParams;
+        use codex_protocol::ConversationId as ConvId;
+        use codex_protocol::config_types::ReasoningEffort;
+        use codex_protocol::config_types::ReasoningSummary;
+        use codex_protocol::protocol::AskForApproval;
+        use codex_protocol::protocol::SandboxPolicy;
+
+        let cid = ConvId::from_string(&conversation_id).expect("parse conversationId");
+        let params = RpcSendUserTurnParams {
+            conversation_id: cid,
+            items: vec![RpcInputItem::Text {
+                text: "Hello".to_string(),
+            }],
+            cwd: tmp.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: "mock-model".to_string(),
+            effort: Some(ReasoningEffort::Medium),
+            summary: ReasoningSummary::Auto,
+        };
+        let req = RpcRequest {
+            id: RpcRequestId::Integer(4),
+            method: "sendUserTurn".to_string(),
+            params: Some(serde_json::to_value(&params).unwrap()),
+        };
+        let wire = serde_json::to_string(&RpcMessage::Request(req)).unwrap();
+        ws1.send(WsMsg::Text(wire.into())).await.unwrap();
+
+        for _ in 0..50 {
+            if let Ok(Some(Ok(WsMsg::Text(txt)))) =
+                timeout(Duration::from_millis(200), ws1.next()).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+            {
+                if v.get("id").and_then(serde_json::Value::as_i64) == Some(4) {
+                    break;
+                }
+                if v.get("method").and_then(|m| m.as_str()) == Some("codex/event/task_complete") {
+                    ws1_task_complete_early = true;
+                }
+            }
+        }
+
+        let ws1_task = if ws1_task_complete_early {
+            true
+        } else {
+            wait_for_method(&mut ws1, "codex/event/task_complete", 100).await
+        };
+        let ws2_task = if ws2_task_complete_early {
+            true
+        } else {
+            wait_for_method(&mut ws2, "codex/event/task_complete", 100).await
+        };
+
+        assert!(ws1_task, "primary listener should receive task_complete");
+        assert!(ws2_task, "secondary listener should receive task_complete");
     }
 }
