@@ -1225,7 +1225,7 @@ impl CodexMessageProcessor {
             })
             .collect();
 
-        let _ = conversation
+        match conversation
             .submit(Op::UserTurn {
                 items: mapped_items,
                 cwd,
@@ -1236,11 +1236,26 @@ impl CodexMessageProcessor {
                 summary,
                 final_output_json_schema: None,
             })
-            .await;
-
-        self.outgoing
-            .send_response(request_id, SendUserTurnResponse {})
-            .await;
+            .await
+        {
+            Ok(_) => {
+                self.outgoing
+                    .send_response(request_id, SendUserTurnResponse {})
+                    .await;
+            }
+            Err(err) => {
+                error!(
+                    "failed to submit user turn for conversation {}: {}",
+                    conversation_id, err
+                );
+                let error = JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to submit turn: {err}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+            }
+        }
     }
 
     async fn interrupt_conversation(
@@ -1715,11 +1730,18 @@ fn extract_conversation_summary(
         Some(session_meta.timestamp.clone())
     };
 
+    let cwd = if session_meta.cwd.as_os_str().is_empty() {
+        None
+    } else {
+        Some(session_meta.cwd.clone())
+    };
+
     Some(ConversationSummary {
         conversation_id: session_meta.id,
         timestamp,
         path,
         preview: preview.to_string(),
+        cwd,
     })
 }
 
@@ -1772,6 +1794,7 @@ mod tests {
         );
         assert_eq!(summary.path, path);
         assert_eq!(summary.preview, "Count to 5");
+        assert_eq!(summary.cwd, Some(PathBuf::from("/")));
         Ok(())
     }
 }
