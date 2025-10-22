@@ -14,7 +14,11 @@ use uuid::Uuid;
 
 use super::SESSIONS_SUBDIR;
 use crate::protocol::EventMsg;
+<<<<<<< HEAD
 use codex_file_search as file_search;
+=======
+use codex_protocol::models::ResponseItem;
+>>>>>>> 561857afe (app-server: listConversations improvements)
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
@@ -52,7 +56,7 @@ struct HeadTailSummary {
     head: Vec<serde_json::Value>,
     tail: Vec<serde_json::Value>,
     saw_session_meta: bool,
-    saw_user_event: bool,
+    saw_user_message: bool,
     source: Option<SessionSource>,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -202,14 +206,13 @@ async fn traverse_directories_for_paths(
                         .await
                         .unwrap_or_default();
                     if !allowed_sources.is_empty()
-                        && !summary
-                            .source
-                            .is_some_and(|source| allowed_sources.iter().any(|s| s == &source))
+                        && let Some(source) = summary.source
+                        && !allowed_sources.iter().any(|s| s == &source)
                     {
                         continue;
                     }
-                    // Apply filters: must have session meta and at least one user message event
-                    if summary.saw_session_meta && summary.saw_user_event {
+                    // Apply filters: must have session meta and at least one user message
+                    if summary.saw_session_meta && summary.saw_user_message {
                         let HeadTailSummary {
                             head,
                             tail,
@@ -364,6 +367,12 @@ async fn read_head_and_tail(
                 }
             }
             RolloutItem::ResponseItem(item) => {
+                if matches!(
+                    &item,
+                    ResponseItem::Message { role, .. } if role == "user"
+                ) {
+                    summary.saw_user_message = true;
+                }
                 summary.created_at = summary
                     .created_at
                     .clone()
@@ -380,7 +389,7 @@ async fn read_head_and_tail(
             }
             RolloutItem::EventMsg(ev) => {
                 if matches!(ev, EventMsg::UserMessage(_)) {
-                    summary.saw_user_event = true;
+                    summary.saw_user_message = true;
                 }
             }
         }

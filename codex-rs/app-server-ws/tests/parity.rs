@@ -557,30 +557,30 @@ async fn parity_exec_approval_roundtrip() -> Result<()> {
     for _ in 0..200 {
         match timeout(Duration::from_millis(200), ws.next()).await {
             Ok(Some(Ok(WsMsg::Text(txt)))) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-                        if method == "execCommandApproval" {
-                            let id_value = v
-                                .get("id")
-                                .cloned()
-                                .context("approval request missing id")?;
-                            let resp =
-                                RpcMessage::Response(codex_app_server_protocol::JSONRPCResponse {
-                                    id: serde_json::from_value(id_value)
-                                        .context("failed to parse approval request id")?,
-                                    result: serde_json::json!({
-                                        "decision": codex_core::protocol::ReviewDecision::Approved,
-                                    }),
-                                });
-                            let resp_wire = serde_json::to_string(&resp)
-                                .context("failed to serialize approval response")?;
-                            ws.send(WsMsg::Text(resp_wire.into()))
-                                .await
-                                .context("failed to send approval response")?;
-                        } else if method == "codex/event/task_complete" {
-                            saw_task_complete = true;
-                            break;
-                        }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+                    && let Some(method) = v.get("method").and_then(|m| m.as_str())
+                {
+                    if method == "execCommandApproval" {
+                        let id_value = v
+                            .get("id")
+                            .cloned()
+                            .context("approval request missing id")?;
+                        let resp =
+                            RpcMessage::Response(codex_app_server_protocol::JSONRPCResponse {
+                                id: serde_json::from_value(id_value)
+                                    .context("failed to parse approval request id")?,
+                                result: serde_json::json!({
+                                    "decision": codex_core::protocol::ReviewDecision::Approved,
+                                }),
+                            });
+                        let resp_wire = serde_json::to_string(&resp)
+                            .context("failed to serialize approval response")?;
+                        ws.send(WsMsg::Text(resp_wire.into()))
+                            .await
+                            .context("failed to send approval response")?;
+                    } else if method == "codex/event/task_complete" {
+                        saw_task_complete = true;
+                        break;
                     }
                 }
             }

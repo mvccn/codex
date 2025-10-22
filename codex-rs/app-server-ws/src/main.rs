@@ -18,6 +18,7 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol_config_types::SandboxMode;
 use futures_util::StreamExt;
 use futures_util::sink::SinkExt;
+use std::future::pending;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -144,11 +145,14 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal() {
     match tokio::signal::ctrl_c().await {
         Ok(()) => info!(target: "codex-app-server-ws", "ctrl+c received; shutting down"),
-        Err(err) => warn!(
-            target: "codex-app-server-ws",
-            %err,
-            "failed to install ctrl+c handler"
-        ),
+        Err(err) => {
+            warn!(
+                target: "codex-app-server-ws",
+                %err,
+                "failed to install ctrl+c handler; continuing without graceful shutdown"
+            );
+            pending::<()>().await;
+        }
     }
 }
 
@@ -225,6 +229,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 mod tests {
     use super::*;
     use axum::Router;
+    use serde_json::Value;
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
@@ -332,6 +337,324 @@ mod tests {
         assert!(
             saw_session_configured,
             "expected sessionConfigured notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_conversations_includes_cwd() {
+        let overrides_cli = CliConfigOverrides {
+            raw_overrides: vec![],
+        };
+        let cli_overrides = overrides_cli.parse_overrides().unwrap();
+        let config = Config::load_with_cli_overrides(cli_overrides, ConfigOverrides::default())
+            .await
+            .expect("load config");
+        let engine = AppServerEngine::new(Arc::new(config), None);
+        let state = AppState {
+            auth_token: None,
+            engine,
+        };
+        let addr = spawn_server(state).await;
+
+        let url = format!("ws://{addr}/ws");
+        let (mut ws, _resp) = connect_async(url).await.unwrap();
+
+        // Initialize connection
+        let init = json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": { "name": "tests", "version": "0.0.0" } }
+        });
+        ws.send(WsMsg::Text(init.to_string().into())).await.unwrap();
+
+        // Create a new conversation with a specific cwd.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd_string = tmp.path().to_string_lossy().to_string();
+        let new_conv = json!({
+            "method": "newConversation",
+            "id": 2,
+            "params": { "cwd": cwd_string }
+        });
+        ws.send(WsMsg::Text(new_conv.to_string().into()))
+            .await
+            .unwrap();
+
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+
+        let mut conversation_id: Option<String> = None;
+        let mut saw_session_configured = false;
+        for _ in 0..100 {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(WsMsg::Text(txt)))) => {
+                    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+                        continue;
+                    };
+                    if v.get("id").and_then(Value::as_i64) == Some(2)
+                        && let Some(result) = v.get("result")
+                        && let Some(cid) = result.get("conversationId").and_then(Value::as_str)
+                    {
+                        conversation_id = Some(cid.to_string());
+                    }
+                    if v.get("method")
+                        .and_then(Value::as_str)
+                        .is_some_and(|m| m == "sessionConfigured")
+                    {
+                        saw_session_configured = true;
+                    }
+                    if conversation_id.is_some() && saw_session_configured {
+                        break;
+                    }
+                }
+                Ok(Some(Ok(WsMsg::Close(_)))) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let conversation_id =
+            conversation_id.expect("newConversation response should include conversationId");
+
+        // Wait for sessionConfigured before listing
+        if !saw_session_configured {
+            assert!(
+                wait_for_method(&mut ws, "sessionConfigured", 100).await,
+                "expected sessionConfigured notification"
+            );
+        }
+
+        // Send a simple user message so the rollout has a preview entry.
+        use codex_app_server_protocol::InputItem as RpcInputItem;
+        use codex_app_server_protocol::JSONRPCMessage as RpcMessage;
+        use codex_app_server_protocol::JSONRPCRequest as RpcRequest;
+        use codex_app_server_protocol::RequestId as RpcRequestId;
+        use codex_app_server_protocol::SendUserMessageParams as RpcSendUserMessageParams;
+        use codex_protocol::ConversationId as ConvId;
+
+        let cid = ConvId::from_string(&conversation_id).expect("parse conversationId");
+        let params = RpcSendUserMessageParams {
+            conversation_id: cid,
+            items: vec![RpcInputItem::Text {
+                text: "list cwd probe".to_string(),
+            }],
+        };
+        let send_request = RpcMessage::Request(RpcRequest {
+            id: RpcRequestId::Integer(4),
+            method: "sendUserMessage".to_string(),
+            params: Some(serde_json::to_value(&params).expect("serialize params")),
+        });
+        ws.send(WsMsg::Text(
+            serde_json::to_string(&send_request).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        // Wait for sendUserMessage response (id 4) to ensure the message was processed.
+        for _ in 0..100 {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(WsMsg::Text(txt)))) => {
+                    if serde_json::from_str::<Value>(&txt)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(Value::as_i64))
+                        == Some(4)
+                    {
+                        break;
+                    }
+                }
+                Ok(Some(Ok(WsMsg::Close(_)))) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        // Request listConversations
+        let list_request = json!({
+            "method": "listConversations",
+            "id": 3,
+            "params": { "pageSize": 20 }
+        });
+        ws.send(WsMsg::Text(list_request.to_string().into()))
+            .await
+            .unwrap();
+
+        let mut saw_list_response = false;
+        for _ in 0..200 {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(WsMsg::Text(txt)))) => {
+                    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+                        continue;
+                    };
+                    if v.get("id").and_then(Value::as_i64) != Some(3) {
+                        continue;
+                    }
+                    let Some(items) = v
+                        .get("result")
+                        .and_then(|r| r.get("items"))
+                        .and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+
+                    let entry = items.iter().find(|item| {
+                        item.get("conversationId")
+                            .and_then(Value::as_str)
+                            .map(|cid| cid == conversation_id)
+                            .unwrap_or(false)
+                    });
+
+                    let Some(entry) = entry else {
+                        panic!(
+                            "expected listConversations response to include newly created conversation"
+                        );
+                    };
+
+                    let cwd = entry.get("cwd").and_then(Value::as_str).unwrap_or_default();
+                    assert_eq!(
+                        cwd, cwd_string,
+                        "listConversations entry should include cwd"
+                    );
+                    saw_list_response = true;
+                    break;
+                }
+                Ok(Some(Ok(WsMsg::Close(_)))) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            saw_list_response,
+            "expected listConversations response with id=3"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_lists_existing_sessions_on_disk() {
+        use std::fs;
+        use uuid::Uuid;
+
+        // Create a temporary CODEX_HOME with a single rollout that looks like a TUI/CLI session.
+        let codex_home = tempfile::tempdir().expect("tmp codex_home");
+        // Setting env vars mutates global state and is unsafe in Rust 2024.
+        unsafe {
+            std::env::set_var("CODEX_HOME", codex_home.path());
+        }
+
+        let ts = "2025-01-02T12-00-00";
+        let uuid = Uuid::new_v4();
+        let year = &ts[0..4];
+        let month = &ts[5..7];
+        let day = &ts[8..10];
+        let dir = codex_home
+            .path()
+            .join("sessions")
+            .join(year)
+            .join(month)
+            .join(day);
+        fs::create_dir_all(&dir).expect("create sessions dir");
+
+        let file_path = dir.join(format!("rollout-{ts}-{uuid}.jsonl"));
+
+        // Write meta + a plain user message ResponseItem so the scanner picks it up.
+        let meta_line = serde_json::json!({
+            "timestamp": "2025-01-02T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": uuid,
+                "timestamp": "2025-01-02T12:00:00Z",
+                "cwd": "/",
+                "originator": "codex_tui_rs",
+                "cli_version": "0.0.0",
+                "instructions": null,
+                "source": "cli"
+            }
+        });
+        let user_line = serde_json::json!({
+            "timestamp": "2025-01-02T12:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello from tui"}]
+            }
+        });
+        fs::write(&file_path, format!("{meta_line}\n{user_line}\n")).expect("write rollout file");
+
+        // Start WS server with config derived from CODEX_HOME
+        let overrides_cli = CliConfigOverrides {
+            raw_overrides: vec![],
+        };
+        let cli_overrides = overrides_cli.parse_overrides().unwrap();
+        let config = Config::load_with_cli_overrides(cli_overrides, ConfigOverrides::default())
+            .await
+            .expect("load config");
+        let engine = AppServerEngine::new(Arc::new(config), None);
+        let state = AppState {
+            auth_token: None,
+            engine,
+        };
+        let addr = spawn_server(state).await;
+
+        // Connect WS and initialize
+        let url = format!("ws://{addr}/ws");
+        let (mut ws, _resp) = connect_async(url).await.unwrap();
+        let init = json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": { "name": "tests", "version": "0.0.0" } }
+        });
+        ws.send(WsMsg::Text(init.to_string().into())).await.unwrap();
+
+        // Request listConversations and expect our file to be present.
+        let list_request = json!({
+            "method": "listConversations",
+            "id": 2,
+            "params": { "pageSize": 50 }
+        });
+        ws.send(WsMsg::Text(list_request.to_string().into()))
+            .await
+            .unwrap();
+
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+        let mut saw = false;
+        for _ in 0..50 {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(WsMsg::Text(txt)))) => {
+                    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+                        continue;
+                    };
+                    if v.get("id").and_then(Value::as_i64) != Some(2) {
+                        continue;
+                    }
+                    let Some(items) = v
+                        .get("result")
+                        .and_then(|r| r.get("items"))
+                        .and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+
+                    let expected_path = std::fs::canonicalize(&file_path).unwrap();
+                    saw = items.iter().any(|it| {
+                        it.get("path")
+                            .and_then(Value::as_str)
+                            .map(|p| p == expected_path.to_string_lossy())
+                            .unwrap_or(false)
+                    });
+                    if saw {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw,
+            "expected listConversations to include preexisting TUI session"
         );
     }
 

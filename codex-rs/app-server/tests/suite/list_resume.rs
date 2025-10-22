@@ -57,6 +57,7 @@ async fn test_list_and_resume_conversations() {
         .send_list_conversations_request(ListConversationsParams {
             page_size: Some(2),
             cursor: None,
+            cwd_prefix: None,
         })
         .await
         .expect("send listConversations");
@@ -82,6 +83,7 @@ async fn test_list_and_resume_conversations() {
         .send_list_conversations_request(ListConversationsParams {
             page_size: Some(2),
             cursor: next_cursor,
+            cwd_prefix: None,
         })
         .await
         .expect("send listConversations page 2");
@@ -179,7 +181,7 @@ fn create_fake_rollout(codex_home: &Path, filename_ts: &str, meta_rfc3339: &str,
         })
         .to_string(),
     );
-    // Minimal user message entry as a persisted response item (with envelope timestamp)
+    // Minimal user message entry as a persisted response item (with envelope timestamp).
     lines.push(
         json!({
             "timestamp": meta_rfc3339,
@@ -188,19 +190,6 @@ fn create_fake_rollout(codex_home: &Path, filename_ts: &str, meta_rfc3339: &str,
                 "type":"message",
                 "role":"user",
                 "content":[{"type":"input_text","text": preview}]
-            }
-        })
-        .to_string(),
-    );
-    // Add a matching user message event line to satisfy filters
-    lines.push(
-        json!({
-            "timestamp": meta_rfc3339,
-            "type":"event_msg",
-            "payload": {
-                "type":"user_message",
-                "message": preview,
-                "kind": "plain"
             }
         })
         .to_string(),

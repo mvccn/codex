@@ -33,6 +33,32 @@ use codex_protocol::protocol::UserMessageEvent;
 
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
 
+fn default_head(uuid: Uuid, timestamp: &str) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": uuid,
+            "timestamp": timestamp,
+            "instructions": null,
+            "cwd": ".",
+            "originator": "test_originator",
+            "cli_version": "test_version",
+            "source": "vscode",
+        }),
+        user_message_value("Hello from user"),
+    ]
+}
+
+fn user_message_value(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text
+        }]
+    })
+}
+
 fn write_session_file(
     root: &Path,
     ts_str: &str,
@@ -76,17 +102,20 @@ fn write_session_file(
     });
     writeln!(file, "{meta}")?;
 
-    // Include at least one user message event to satisfy listing filters
-    let user_event = serde_json::json!({
+    // Include at least one user message response to satisfy listing filters.
+    let user_message = serde_json::json!({
         "timestamp": ts_str,
-        "type": "event_msg",
+        "type": "response_item",
         "payload": {
-            "type": "user_message",
-            "message": "Hello from user",
-            "kind": "plain"
-        }
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Hello from user"
+            }]
+        },
     });
-    writeln!(file, "{user_event}")?;
+    writeln!(file, "{user_message}")?;
 
     for i in 0..num_records {
         let rec = serde_json::json!({
@@ -158,33 +187,9 @@ async fn test_list_conversations_latest_first() {
         .join("01")
         .join(format!("rollout-2025-01-01T12-00-00-{u1}.jsonl"));
 
-    let head_3 = vec![serde_json::json!({
-        "id": u3,
-        "timestamp": "2025-01-03T12-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
-    let head_2 = vec![serde_json::json!({
-        "id": u2,
-        "timestamp": "2025-01-02T12-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
-    let head_1 = vec![serde_json::json!({
-        "id": u1,
-        "timestamp": "2025-01-01T12-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
+    let head_3 = default_head(u3, "2025-01-03T12-00-00");
+    let head_2 = default_head(u2, "2025-01-02T12-00-00");
+    let head_1 = default_head(u1, "2025-01-01T12-00-00");
 
     let expected_cursor: Cursor =
         serde_json::from_str(&format!("\"2025-01-01T12-00-00|{u1}\"")).unwrap();
@@ -194,21 +199,21 @@ async fn test_list_conversations_latest_first() {
             ConversationItem {
                 path: p1,
                 head: head_3,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-01-03T12-00-00".into()),
                 updated_at: Some("2025-01-03T12-00-00".into()),
             },
             ConversationItem {
                 path: p2,
                 head: head_2,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-01-02T12-00-00".into()),
                 updated_at: Some("2025-01-02T12-00-00".into()),
             },
             ConversationItem {
                 path: p3,
                 head: head_1,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-01-01T12-00-00".into()),
                 updated_at: Some("2025-01-01T12-00-00".into()),
             },
@@ -290,24 +295,8 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("04")
         .join(format!("rollout-2025-03-04T09-00-00-{u4}.jsonl"));
-    let head_5 = vec![serde_json::json!({
-        "id": u5,
-        "timestamp": "2025-03-05T09-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
-    let head_4 = vec![serde_json::json!({
-        "id": u4,
-        "timestamp": "2025-03-04T09-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
+    let head_5 = default_head(u5, "2025-03-05T09-00-00");
+    let head_4 = default_head(u4, "2025-03-04T09-00-00");
     let expected_cursor1: Cursor =
         serde_json::from_str(&format!("\"2025-03-04T09-00-00|{u4}\"")).unwrap();
     let expected_page1 = ConversationsPage {
@@ -315,14 +304,14 @@ async fn test_pagination_cursor() {
             ConversationItem {
                 path: p5,
                 head: head_5,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-03-05T09-00-00".into()),
                 updated_at: Some("2025-03-05T09-00-00".into()),
             },
             ConversationItem {
                 path: p4,
                 head: head_4,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-03-04T09-00-00".into()),
                 updated_at: Some("2025-03-04T09-00-00".into()),
             },
@@ -353,24 +342,8 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("02")
         .join(format!("rollout-2025-03-02T09-00-00-{u2}.jsonl"));
-    let head_3 = vec![serde_json::json!({
-        "id": u3,
-        "timestamp": "2025-03-03T09-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
-    let head_2 = vec![serde_json::json!({
-        "id": u2,
-        "timestamp": "2025-03-02T09-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
+    let head_3 = default_head(u3, "2025-03-03T09-00-00");
+    let head_2 = default_head(u2, "2025-03-02T09-00-00");
     let expected_cursor2: Cursor =
         serde_json::from_str(&format!("\"2025-03-02T09-00-00|{u2}\"")).unwrap();
     let expected_page2 = ConversationsPage {
@@ -378,14 +351,14 @@ async fn test_pagination_cursor() {
             ConversationItem {
                 path: p3,
                 head: head_3,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-03-03T09-00-00".into()),
                 updated_at: Some("2025-03-03T09-00-00".into()),
             },
             ConversationItem {
                 path: p2,
                 head: head_2,
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some("2025-03-02T09-00-00".into()),
                 updated_at: Some("2025-03-02T09-00-00".into()),
             },
@@ -410,22 +383,14 @@ async fn test_pagination_cursor() {
         .join("03")
         .join("01")
         .join(format!("rollout-2025-03-01T09-00-00-{u1}.jsonl"));
-    let head_1 = vec![serde_json::json!({
-        "id": u1,
-        "timestamp": "2025-03-01T09-00-00",
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
+    let head_1 = default_head(u1, "2025-03-01T09-00-00");
     let expected_cursor3: Cursor =
         serde_json::from_str(&format!("\"2025-03-01T09-00-00|{u1}\"")).unwrap();
     let expected_page3 = ConversationsPage {
         items: vec![ConversationItem {
             path: p1,
             head: head_1,
-            tail: Vec::new(),
+            tail: vec![user_message_value("Hello from user")],
             created_at: Some("2025-03-01T09-00-00".into()),
             updated_at: Some("2025-03-01T09-00-00".into()),
         }],
@@ -459,21 +424,13 @@ async fn test_get_conversation_contents() {
         .join("04")
         .join("01")
         .join(format!("rollout-2025-04-01T10-30-00-{uuid}.jsonl"));
-    let expected_head = vec![serde_json::json!({
-        "id": uuid,
-        "timestamp": ts,
-        "instructions": null,
-        "cwd": ".",
-        "originator": "test_originator",
-        "cli_version": "test_version",
-        "source": "vscode",
-    })];
+    let expected_head = default_head(uuid, ts);
     let expected_cursor: Cursor = serde_json::from_str(&format!("\"{ts}|{uuid}\"")).unwrap();
     let expected_page = ConversationsPage {
         items: vec![ConversationItem {
             path: expected_path,
             head: expected_head,
-            tail: Vec::new(),
+            tail: vec![user_message_value("Hello from user")],
             created_at: Some(ts.into()),
             updated_at: Some(ts.into()),
         }],
@@ -497,14 +454,21 @@ async fn test_get_conversation_contents() {
             "source": "vscode",
         }
     });
-    let user_event = serde_json::json!({
+    let user_message = serde_json::json!({
         "timestamp": ts,
-        "type": "event_msg",
-        "payload": {"type": "user_message", "message": "Hello from user", "kind": "plain"}
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Hello from user"
+            }]
+        }
     });
     let rec0 = serde_json::json!({"record_type": "response", "index": 0});
     let rec1 = serde_json::json!({"record_type": "response", "index": 1});
-    let expected_content = format!("{meta}\n{user_event}\n{rec0}\n{rec1}\n");
+    let expected_content = format!("{meta}\n{user_message}\n{rec0}\n{rec1}\n");
     assert_eq!(content, expected_content);
 }
 
@@ -801,31 +765,21 @@ async fn test_stable_ordering_same_second_pagination() {
         .join("07")
         .join("01")
         .join(format!("rollout-2025-07-01T00-00-00-{u2}.jsonl"));
-    let head = |u: Uuid| -> Vec<serde_json::Value> {
-        vec![serde_json::json!({
-            "id": u,
-            "timestamp": ts,
-            "instructions": null,
-            "cwd": ".",
-            "originator": "test_originator",
-            "cli_version": "test_version",
-            "source": "vscode",
-        })]
-    };
+    let head = |u: Uuid| -> Vec<serde_json::Value> { default_head(u, ts) };
     let expected_cursor1: Cursor = serde_json::from_str(&format!("\"{ts}|{u2}\"")).unwrap();
     let expected_page1 = ConversationsPage {
         items: vec![
             ConversationItem {
                 path: p3,
                 head: head(u3),
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some(ts.to_string()),
                 updated_at: Some(ts.to_string()),
             },
             ConversationItem {
                 path: p2,
                 head: head(u2),
-                tail: Vec::new(),
+                tail: vec![user_message_value("Hello from user")],
                 created_at: Some(ts.to_string()),
                 updated_at: Some(ts.to_string()),
             },
@@ -855,7 +809,7 @@ async fn test_stable_ordering_same_second_pagination() {
         items: vec![ConversationItem {
             path: p1,
             head: head(u1),
-            tail: Vec::new(),
+            tail: vec![user_message_value("Hello from user")],
             created_at: Some(ts.to_string()),
             updated_at: Some(ts.to_string()),
         }],

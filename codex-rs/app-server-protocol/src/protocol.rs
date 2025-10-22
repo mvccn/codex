@@ -313,6 +313,11 @@ pub struct ListConversationsParams {
     /// Opaque pagination cursor returned by a previous call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Optional cwd prefix filter: when set, only sessions whose cwd is under
+    /// this directory (prefix match after best-effort canonicalization) are
+    /// returned. When omitted, no cwd filtering is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_prefix: Option<std::path::PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -321,6 +326,8 @@ pub struct ConversationSummary {
     pub conversation_id: ConversationId,
     pub path: PathBuf,
     pub preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// RFC3339 timestamp string for the session start, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,

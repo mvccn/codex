@@ -868,10 +868,20 @@ impl CodexMessageProcessor {
             }
         };
 
+        let cwd_prefix = params.cwd_prefix.as_ref().cloned();
         let items = page
             .items
             .into_iter()
             .filter_map(|it| extract_conversation_summary(it.path, &it.head))
+            // Filter out "empty" sessions that have no plain user input preview
+            .filter(|summary| !summary.preview.trim().is_empty())
+            .filter(|summary| match cwd_prefix.as_ref() {
+                None => true,
+                Some(prefix) => match (&summary.cwd, prefix) {
+                    (Some(cwd), prefix) => has_prefix_with_canonicalization(cwd, prefix),
+                    (None, _) => false,
+                },
+            })
             .collect();
 
         // Encode next_cursor as a plain string
@@ -1711,13 +1721,17 @@ fn extract_conversation_summary(
         None => return None,
     };
 
+    // Prefer a plain user message; if none exists yet (e.g., only initial
+    // <user_instructions>/<environment_context> entries are present), fall back
+    // to an empty preview so the session is still listed.
     let preview = head
         .iter()
         .filter_map(|value| serde_json::from_value::<ResponseItem>(value.clone()).ok())
         .find_map(|item| match codex_core::parse_turn_item(&item) {
             Some(TurnItem::UserMessage(user)) => Some(user.message()),
             _ => None,
-        })?;
+        })
+        .unwrap_or_else(|| "".to_string());
 
     let preview = match preview.find(USER_MESSAGE_BEGIN) {
         Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim(),
@@ -1743,6 +1757,26 @@ fn extract_conversation_summary(
         preview: preview.to_string(),
         cwd,
     })
+}
+
+fn has_prefix_with_canonicalization(path: &std::path::Path, prefix: &std::path::Path) -> bool {
+    let canon_path = std::fs::canonicalize(path).ok();
+    let canon_prefix = std::fs::canonicalize(prefix).ok();
+    match (canon_path.as_ref(), canon_prefix.as_ref()) {
+        (Some(p), Some(pref)) => p.starts_with(pref),
+        _ => {
+            fn normalize(s: &str) -> String {
+                if s.starts_with("/private/") {
+                    s.trim_start_matches("/private").to_string()
+                } else {
+                    s.to_string()
+                }
+            }
+            let p = normalize(&path.to_string_lossy());
+            let pref = normalize(&prefix.to_string_lossy());
+            p.starts_with(&pref)
+        }
+    }
 }
 
 #[cfg(test)]

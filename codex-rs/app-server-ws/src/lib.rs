@@ -199,11 +199,11 @@ mod tests {
             if let Ok(Some(Ok(WsMsg::Text(txt)))) =
                 timeout(Duration::from_millis(200), ws.next()).await
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-                    && v.get("method").and_then(|m| m.as_str()) == Some("sessionConfigured")
-                {
-                    saw_session_configured = true;
-                    break;
-                }
+                && v.get("method").and_then(|m| m.as_str()) == Some("sessionConfigured")
+            {
+                saw_session_configured = true;
+                break;
+            }
         }
         assert!(
             saw_session_configured,
@@ -258,10 +258,10 @@ mod tests {
                     .ok()
                     .and_then(|v| v.get("id").and_then(serde_json::Value::as_i64))
                     == Some(2)
-                {
-                    saw_ack = true;
-                    break;
-                }
+            {
+                saw_ack = true;
+                break;
+            }
         }
         assert!(
             saw_ack,
