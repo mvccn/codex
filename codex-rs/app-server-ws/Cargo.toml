@@ -23,6 +23,8 @@ codex-common = { path = "../common", features = ["cli"] }
 codex-core = { path = "../core" }
 codex-app-server = { path = "../app-server" }
 codex-app-server-protocol = { path = "../app-server-protocol" }
+codex-apply-patch = { path = "../apply-patch" }
+codex-protocol = { path = "../protocol" }
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"

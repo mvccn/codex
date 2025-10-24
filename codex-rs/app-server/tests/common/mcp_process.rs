@@ -283,6 +283,7 @@ impl McpProcess {
         self.send_request("resumeConversation", params).await
     }
 
+
     /// Send a `loginApiKey` JSON-RPC request.
     pub async fn send_login_api_key_request(
         &mut self,

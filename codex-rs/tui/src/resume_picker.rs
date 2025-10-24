@@ -160,6 +160,7 @@ struct PickerState {
     selected: usize,
     scroll_top: usize,
     query: String,
+    meta_cache: SearchMetaCache,
     search_state: SearchState,
     next_request_token: usize,
     next_search_token: usize,
@@ -241,6 +242,7 @@ impl PickerState {
             selected: 0,
             scroll_top: 0,
             query: String::new(),
+            meta_cache: SearchMetaCache::default(),
             search_state: SearchState::Idle,
             next_request_token: 0,
             next_search_token: 0,
@@ -397,14 +399,15 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
-        if self.query.is_empty() {
+        let parsed = SearchQuery::parse(&self.query);
+        if parsed.is_empty() {
             self.filtered_rows = self.all_rows.clone();
         } else {
-            let q = self.query.to_lowercase();
+            let cache = &mut self.meta_cache;
             self.filtered_rows = self
                 .all_rows
                 .iter()
-                .filter(|r| r.preview.to_lowercase().contains(&q))
+                .filter(|r| parsed.matches_row(r, cache))
                 .cloned()
                 .collect();
         }

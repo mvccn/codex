@@ -14,11 +14,8 @@ use uuid::Uuid;
 
 use super::SESSIONS_SUBDIR;
 use crate::protocol::EventMsg;
-<<<<<<< HEAD
 use codex_file_search as file_search;
-=======
 use codex_protocol::models::ResponseItem;
->>>>>>> 561857afe (app-server: listConversations improvements)
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
@@ -269,7 +266,10 @@ fn build_next_cursor(items: &[ConversationItem]) -> Option<Cursor> {
 
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
 /// and returns them sorted descending by the parsed key.
-async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
+async fn collect_dirs_desc<T, F>(
+    parent: &Path,
+    parse: F,
+) -> io::Result<Vec<(T, PathBuf)>>
 where
     T: Ord + Copy,
     F: Fn(&str) -> Option<T>,

@@ -101,6 +101,8 @@ impl RolloutRecorder {
         get_conversations(codex_home, page_size, cursor, allowed_sources).await
     }
 
+    
+
     /// Attempt to create a new [`RolloutRecorder`]. If the sessions directory
     /// cannot be created or the rollout file cannot be opened we return the
     /// error so the caller can decide whether to disable persistence.

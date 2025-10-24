@@ -897,6 +897,7 @@ dependencies = [
  "clap",
  "codex-app-server",
  "codex-app-server-protocol",
+ "codex-apply-patch",
  "codex-common",
  "codex-core",
  "codex-protocol",
