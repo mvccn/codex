@@ -822,6 +822,87 @@ pub(crate) fn create_tools_json_for_chat_completions_api(
     Ok(tools_json)
 }
 
+/// Returns JSON values that are compatible with Gemini's native tool
+/// declarations. This is intentionally a thin wrapper around the existing
+/// `ToolSpec` / JSON-Schema representation: we reuse the same tool catalog
+/// and simply repackage it into the `function_declarations` envelope that
+/// Gemini expects.
+pub(crate) fn create_tools_json_for_gemini_api(
+    tools: &[ToolSpec],
+) -> crate::error::Result<Vec<serde_json::Value>> {
+    // Start from the Responses API representation so we can leverage the
+    // existing serde mapping from `ToolSpec` to JSON. Then, for each tool
+    // that encodes a function, extract the function payload and wrap it in a
+    // Gemini-style `function_declarations` object.
+    let responses_api_tools_json = create_tools_json_for_responses_api(tools)?;
+
+    let tools_json = responses_api_tools_json
+        .into_iter()
+        .filter_map(|tool| {
+            // Tools that are not functions (if any) are ignored; Gemini only
+            // consumes function declarations for tool calls.
+            let type_field = tool.get("type");
+            if type_field != Some(&serde_json::Value::String("function".to_string())) {
+                return None;
+            }
+
+            // For Responses API, a function tool is represented as:
+            // { "type": "function", "name": "...", "description": "...", "parameters": { ... } }
+            // For Gemini, we need:
+            // { "function_declarations": [ { "name": "...", "description": "...", "parameters": { ... } } ] }
+            if let Some(map) = tool.as_object() {
+                // Clone the object so we can safely transform it without
+                // mutating the original Responses API representation.
+                let mut func = serde_json::Value::Object(map.clone());
+                if let Some(obj) = func.as_object_mut() {
+                    obj.remove("type");
+                }
+                sanitize_gemini_function_declaration(&mut func);
+
+                Some(json!({
+                    "function_declarations": [func],
+                }))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<serde_json::Value>>();
+
+    Ok(tools_json)
+}
+
+/// Strip fields that Gemini does not recognize from a function
+/// declaration. In particular:
+/// - OpenAI-specific `strict` flags on tools.
+/// - JSON Schema `additionalProperties` entries, which Gemini rejects.
+fn sanitize_gemini_function_declaration(func: &mut serde_json::Value) {
+    if let Some(obj) = func.as_object_mut() {
+        // Gemini does not understand the OpenAI-specific `strict` flag.
+        obj.remove("strict");
+
+        if let Some(params) = obj.get_mut("parameters") {
+            strip_key_recursively(params, "additionalProperties");
+        }
+    }
+}
+
+fn strip_key_recursively(value: &mut serde_json::Value, key: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove(key);
+            for (_k, v) in map.iter_mut() {
+                strip_key_recursively(v, key);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                strip_key_recursively(v, key);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn mcp_tool_to_openai_tool(
     fully_qualified_name: String,
     tool: mcp_types::Tool,
@@ -2095,5 +2176,78 @@ Examples of valid command strings:
                 strict: false,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod gemini_tests {
+    use super::*;
+
+    #[test]
+    fn gemini_tools_strip_strict_and_additional_properties() {
+        // Build a representative subset of tools that exercise nested
+        // `additionalProperties` and top-level `strict` flags.
+        let tools = vec![
+            create_exec_command_tool(),
+            create_write_stdin_tool(),
+            create_test_sync_tool(),
+            create_view_image_tool(),
+        ];
+
+        let tools_json =
+            create_tools_json_for_gemini_api(&tools).expect("Gemini tools JSON should build");
+
+        assert!(
+            !tools_json.is_empty(),
+            "expected at least one Gemini tool entry"
+        );
+
+        let serialized = serde_json::to_string(&tools_json).expect("serialize tools_json");
+        assert!(
+            !serialized.contains("strict"),
+            "Gemini tools JSON must not contain `strict`"
+        );
+        assert!(
+            !serialized.contains("additionalProperties"),
+            "Gemini tools JSON must not contain `additionalProperties`"
+        );
+
+        for entry in &tools_json {
+            let obj = entry
+                .as_object()
+                .unwrap_or_else(|| panic!("expected object tool entry, got {entry:?}"));
+            assert!(
+                obj.contains_key("function_declarations"),
+                "missing function_declarations wrapper in {obj:?}"
+            );
+
+            let decls = obj["function_declarations"]
+                .as_array()
+                .unwrap_or_else(|| panic!("function_declarations is not an array in {obj:?}"));
+            assert!(
+                !decls.is_empty(),
+                "function_declarations should contain at least one entry"
+            );
+
+            let func = decls[0]
+                .as_object()
+                .unwrap_or_else(|| panic!("function_declaration is not an object in {decls:?}"));
+            assert!(
+                func.contains_key("name"),
+                "function declaration missing name: {func:?}"
+            );
+            assert!(
+                func.contains_key("parameters"),
+                "function declaration missing parameters: {func:?}"
+            );
+            assert!(
+                !func.contains_key("type"),
+                "function declaration should not carry top-level `type`: {func:?}"
+            );
+            assert!(
+                !func.contains_key("strict"),
+                "function declaration should not carry `strict`: {func:?}"
+            );
+        }
     }
 }

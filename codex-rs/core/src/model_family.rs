@@ -13,6 +13,7 @@ const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
 const GPT_5_CODEX_INSTRUCTIONS: &str = include_str!("../gpt_5_codex_prompt.md");
 const GPT_5_1_INSTRUCTIONS: &str = include_str!("../gpt_5_1_prompt.md");
 const GPT_5_1_CODEX_MAX_INSTRUCTIONS: &str = include_str!("../gpt-5.1-codex-max_prompt.md");
+const GEMINI_CODEX_INSTRUCTIONS: &str = include_str!("../gemini_codex_prompt.md");
 
 /// A model family is a group of models that share certain characteristics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -236,6 +237,11 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             shell_type: ConfigShellToolType::Default,
             support_verbosity: true,
             truncation_policy: TruncationPolicy::Bytes(10_000),
+        )
+    } else if slug.starts_with("models/gemini") || slug.starts_with("gemini") {
+        model_family!(
+            slug, "gemini",
+            base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
         )
     } else {
         None

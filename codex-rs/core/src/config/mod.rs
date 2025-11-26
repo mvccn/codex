@@ -1074,7 +1074,7 @@ impl Config {
             .or(config_profile.model_provider)
             .or(cfg.model_provider)
             .unwrap_or_else(|| "openai".to_string());
-        let model_provider = model_providers
+        let mut model_provider = model_providers
             .get(&model_provider_id)
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -1120,6 +1120,20 @@ impl Config {
         }
         if let Some(model_reasoning_summary_format) = cfg.model_reasoning_summary_format {
             model_family.reasoning_summary_format = model_reasoning_summary_format;
+        }
+
+        // For Gemini providers, if the base URL is not explicitly configured,
+        // derive it from the active model slug using the canonical
+        // `models/{id}:generateContent` REST shape documented at
+        // https://ai.google.dev/gemini-api/docs/models.
+        //
+        // This lets users switch between `models/gemini-2.5-flash` and
+        // `models/gemini-3-pro-preview` without duplicating URL patterns in
+        // their config file or wrapper scripts.
+        if model_provider.base_url.is_none() && model_provider.wire_api == crate::WireApi::Gemini {
+            if let Some(url) = crate::gemini_models::default_gemini_generate_url(&model) {
+                model_provider.base_url = Some(url);
+            }
         }
 
         let openai_model_info = get_model_info(&model_family);

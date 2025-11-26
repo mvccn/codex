@@ -30,6 +30,7 @@ mod deprecation_notice;
 mod exec;
 mod exec_policy;
 mod fork_conversation;
+mod gemini;
 mod grep_files;
 mod items;
 mod json_result;

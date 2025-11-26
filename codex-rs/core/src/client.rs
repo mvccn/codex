@@ -46,6 +46,7 @@ use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
+use crate::gemini::stream_gemini;
 use crate::model_family::ModelFamily;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
@@ -133,6 +134,18 @@ impl ModelClient {
                         self.otel_event_manager.clone(),
                     ))
                 }
+            }
+            WireApi::Gemini => {
+                stream_gemini(
+                    prompt,
+                    &self.config.model_family,
+                    &self.client,
+                    &self.provider,
+                    &self.otel_event_manager,
+                    &self.session_source,
+                    &self.auth_manager,
+                )
+                .await
             }
         }
     }

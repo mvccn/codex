@@ -14,6 +14,8 @@ mod client_common;
 pub mod codex;
 mod codex_conversation;
 mod compact_remote;
+mod gemini;
+mod gemini_models;
 pub use codex_conversation::CodexConversation;
 mod codex_delegate;
 mod command_safety;
@@ -82,6 +84,9 @@ pub use rollout::RolloutRecorder;
 pub use rollout::SESSIONS_SUBDIR;
 pub use rollout::SessionMeta;
 pub use rollout::find_conversation_path_by_id_str;
+
+// Gemini adapter internals remain crate-private. Adapter-specific tests live
+// alongside the implementation modules.
 pub use rollout::list::ConversationItem;
 pub use rollout::list::ConversationsPage;
 pub use rollout::list::Cursor;
