@@ -58,6 +58,7 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 8] = [
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
 ];
+const EXIT_STATUS_GRACE: Duration = Duration::from_millis(50);
 
 fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
     for (key, value) in UNIFIED_EXEC_ENV {
@@ -137,21 +138,25 @@ impl UnifiedExecSessionManager {
             cancellation_token,
         } = session.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected = Self::collect_output_until_deadline(
+        let (collected, exit_signaled) = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
             &cancellation_token,
             deadline,
         )
         .await;
+        let mut has_exited = session.has_exited();
+        if exit_signaled && !has_exited {
+            let _ = session.wait_for_exit_within(EXIT_STATUS_GRACE).await;
+            has_exited = session.has_exited();
+        }
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();
         let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
-        let has_exited = session.has_exited();
         let exit_code = session.exit_code();
         let chunk_id = generate_chunk_id();
-        let process_id = if has_exited {
+        let process_id = if has_exited || exit_signaled {
             None
         } else {
             // Only store session if not exited.
@@ -259,13 +264,16 @@ impl UnifiedExecSessionManager {
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected = Self::collect_output_until_deadline(
+        let (collected, exit_signaled) = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
             &cancellation_token,
             deadline,
         )
         .await;
+        if exit_signaled {
+            tokio::time::sleep(EXIT_STATUS_GRACE).await;
+        }
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();
@@ -568,12 +576,14 @@ impl UnifiedExecSessionManager {
             .map_err(|e| UnifiedExecError::create_session(format!("{e:?}")))
     }
 
+    /// Collect output until `deadline`, returning the buffered bytes and whether an exit signal
+    /// arrived during the wait.
     pub(super) async fn collect_output_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
         deadline: Instant,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, bool) {
         const POST_EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(25);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
@@ -626,7 +636,7 @@ impl UnifiedExecSessionManager {
             }
         }
 
-        collected
+        (collected, exit_signal_received)
     }
 
     fn prune_sessions_if_needed(sessions: &mut HashMap<String, SessionEntry>) {

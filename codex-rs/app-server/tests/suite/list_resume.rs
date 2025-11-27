@@ -184,6 +184,8 @@ async fn test_list_and_resume_conversations() -> Result<()> {
                 model: Some("o3".to_string()),
                 ..Default::default()
             }),
+            initial_messages_tail: None,
+            initial_messages_limit: None,
         })
         .await?;
 
@@ -248,6 +250,8 @@ async fn test_list_and_resume_conversations() -> Result<()> {
                 model: Some("o3".to_string()),
                 ..Default::default()
             }),
+            initial_messages_tail: None,
+            initial_messages_limit: None,
         })
         .await?;
     let notification: JSONRPCNotification = timeout(
@@ -317,6 +321,8 @@ async fn test_list_and_resume_conversations() -> Result<()> {
                 model: Some("o3".to_string()),
                 ..Default::default()
             }),
+            initial_messages_tail: None,
+            initial_messages_limit: None,
         })
         .await?;
     let notification: JSONRPCNotification = timeout(

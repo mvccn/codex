@@ -59,7 +59,7 @@ async fn process_gemini_sse<S>(
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
 ) where
-    S: Stream<Item = Result<Bytes>> + Unpin,
+    S: Stream<Item = Result<Bytes>> + Unpin + Eventsource,
 {
     let mut stream = stream.eventsource();
     let mut assistant_item: Option<ResponseItem> = None;
@@ -340,8 +340,9 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
     flush(&mut current_role, &mut current_parts, &mut contents);
     contents
 }
-// (all Gemini-specific tests live in `core/tests/gemini_*.rs` to keep the
-// production code path focused; see those files for adapter tests.)
+// Adapter-focused Gemini tests live in `core/tests/gemini_*.rs` to keep the
+// production code path focused. Live smoke tests that hit the real Gemini API
+// sit under `live_tests` below.
 
 fn provider_requests_streaming(provider: &ModelProviderInfo) -> bool {
     provider
@@ -582,6 +583,692 @@ async fn stream_gemini_streaming(
         Err(e) => Err(CodexErr::ConnectionFailed(ConnectionFailedError {
             source: e,
         })),
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use anyhow::Context;
+    use anyhow::Result;
+    use anyhow::anyhow;
+    use codex_app_server_protocol::AuthMode;
+    use codex_otel::otel_event_manager::OtelEventManager;
+    use codex_protocol::ConversationId;
+    use codex_protocol::protocol::SessionSource;
+    use core_test_support::skip_if_no_network;
+    use futures::StreamExt;
+    use pretty_assertions::assert_eq;
+    use serde_json::Value;
+    use tempfile::TempDir;
+
+    use crate::ContentItem;
+    use crate::ModelClient;
+    use crate::Prompt;
+    use crate::ResponseEvent;
+    use crate::ResponseItem;
+    use crate::client_common::tools::ResponsesApiTool;
+    use crate::client_common::tools::ToolSpec;
+    use crate::config::Config;
+    use crate::config::ConfigOverrides;
+    use crate::config::ConfigToml;
+    use crate::gemini_models::create_gemini_provider_for_model;
+    use crate::model_family::derive_default_model_family;
+    use crate::model_family::find_family_for_model;
+    use crate::tools::spec::JsonSchema;
+
+    const RUN_LIVE_ENV: &str = "RUN_LIVE_GEMINI";
+    const API_KEY_ENV: &str = "GEMINI_API_KEY";
+    const DEFAULT_MODEL: &str = "models/gemini-2.5-flash";
+
+    struct LiveClient {
+        client: ModelClient,
+        _config: Arc<Config>,
+    }
+
+    /// Build a Config rooted in a temp Codex home so live calls do not touch
+    /// the user's real state.
+    fn load_live_config(codex_home: &TempDir) -> Option<Config> {
+        Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .ok()
+    }
+
+    /// Gate live calls so they only run when explicitly opted in and
+    /// credentials are present.
+    fn should_run_live() -> Option<String> {
+        if std::env::var(RUN_LIVE_ENV).unwrap_or_default() != "1" {
+            eprintln!("skipping live Gemini tests – set {RUN_LIVE_ENV}=1 to enable");
+            return None;
+        }
+
+        if std::env::var(API_KEY_ENV).is_err() {
+            eprintln!("skipping live Gemini tests – {API_KEY_ENV} is not set");
+            return None;
+        }
+
+        let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        Some(model)
+    }
+
+    /// Build a ModelClient pointed at the public Gemini endpoint using the
+    /// provided model slug and the GEMINI_API_KEY header.
+    async fn build_live_client(model: &str) -> Option<LiveClient> {
+        let provider =
+            match create_gemini_provider_for_model(model, "gemini-live", API_KEY_ENV, false) {
+                Some(p) => p,
+                None => {
+                    eprintln!("skipping live Gemini tests – unsupported model slug {model}");
+                    return None;
+                }
+            };
+
+        let codex_home = TempDir::new().ok()?;
+        let mut config = load_live_config(&codex_home)?;
+        config.model = model.to_string();
+        config.model_family = find_family_for_model(&config.model)
+            .unwrap_or_else(|| derive_default_model_family(&config.model));
+        config.model_provider_id = provider.name.clone();
+        config.model_provider = provider.clone();
+        config.show_raw_agent_reasoning = true;
+        let effort = config.model_reasoning_effort;
+        let summary = config.model_reasoning_summary;
+        let config = Arc::new(config);
+
+        let conversation_id = ConversationId::new();
+        let otel_event_manager = OtelEventManager::new(
+            conversation_id,
+            config.model.as_str(),
+            config.model_family.slug.as_str(),
+            None,
+            Some("live@test.com".to_string()),
+            Some(AuthMode::ChatGPT),
+            false,
+            "live".to_string(),
+        );
+
+        let client = ModelClient::new(
+            Arc::clone(&config),
+            None,
+            otel_event_manager,
+            provider,
+            effort,
+            summary,
+            conversation_id,
+            SessionSource::Exec,
+        );
+
+        Some(LiveClient {
+            client,
+            _config: config,
+        })
+    }
+
+    /// Create a Prompt with a single user message and the supplied tool set.
+    fn prompt_with_tools(tools: &[ToolSpec], user_prompt: &str) -> Prompt {
+        let mut prompt = Prompt::default();
+        prompt.input.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: user_prompt.to_string(),
+            }],
+        });
+        prompt.tools = tools.to_vec();
+        prompt
+    }
+
+    /// Common catalog of tools exposed to the live prompt matrix.
+    fn tool_catalog() -> Vec<ToolSpec> {
+        vec![
+            weather_tool(),
+            stock_quote_tool(),
+            create_order_tool(),
+            set_timer_tool(),
+            append_file_tool(),
+            shell_tool(),
+            crate::tools::handlers::PLAN_TOOL.clone(),
+        ]
+    }
+
+    /// Tool spec for basic weather lookup with explicit city + unit fields.
+    fn weather_tool() -> ToolSpec {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "city".to_string(),
+            JsonSchema::String {
+                description: Some("City to fetch weather for.".to_string()),
+            },
+        );
+        properties.insert(
+            "unit".to_string(),
+            JsonSchema::String {
+                description: Some("Temperature unit, e.g. celsius.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "get_weather".to_string(),
+            description: "Look up the current weather for a city.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: Some(vec!["city".to_string(), "unit".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Tool spec used to test tool-choice disambiguation for stock lookups.
+    fn stock_quote_tool() -> ToolSpec {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "symbol".to_string(),
+            JsonSchema::String {
+                description: Some("Ticker symbol to look up, e.g. AAPL.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "get_stock_quote".to_string(),
+            description: "Fetch a real-time stock quote.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: Some(vec!["symbol".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Tool spec for timers with a numeric duration and optional label.
+    fn set_timer_tool() -> ToolSpec {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "minutes".to_string(),
+            JsonSchema::Number {
+                description: Some("How long the timer should run, in minutes.".to_string()),
+            },
+        );
+        properties.insert(
+            "label".to_string(),
+            JsonSchema::String {
+                description: Some("Optional label to show with the timer.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "set_timer".to_string(),
+            description: "Start a countdown timer.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: Some(vec!["minutes".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Tool spec for a nested order payload covering arrays and objects.
+    fn create_order_tool() -> ToolSpec {
+        let mut item_props = BTreeMap::new();
+        item_props.insert(
+            "sku".to_string(),
+            JsonSchema::String {
+                description: Some("Item SKU.".to_string()),
+            },
+        );
+        item_props.insert(
+            "quantity".to_string(),
+            JsonSchema::Number {
+                description: Some("Quantity of the item.".to_string()),
+            },
+        );
+
+        let item_schema = JsonSchema::Object {
+            properties: item_props,
+            required: Some(vec!["sku".to_string(), "quantity".to_string()]),
+            additional_properties: None,
+        };
+
+        let mut shipping_props = BTreeMap::new();
+        shipping_props.insert(
+            "name".to_string(),
+            JsonSchema::String {
+                description: Some("Recipient name.".to_string()),
+            },
+        );
+        shipping_props.insert(
+            "line1".to_string(),
+            JsonSchema::String {
+                description: Some("Street line 1.".to_string()),
+            },
+        );
+        shipping_props.insert(
+            "city".to_string(),
+            JsonSchema::String {
+                description: Some("City.".to_string()),
+            },
+        );
+        shipping_props.insert(
+            "state".to_string(),
+            JsonSchema::String {
+                description: Some("State or province.".to_string()),
+            },
+        );
+        shipping_props.insert(
+            "postal_code".to_string(),
+            JsonSchema::String {
+                description: Some("Postal or ZIP code.".to_string()),
+            },
+        );
+
+        let shipping_schema = JsonSchema::Object {
+            properties: shipping_props,
+            required: Some(vec![
+                "name".to_string(),
+                "line1".to_string(),
+                "city".to_string(),
+                "state".to_string(),
+                "postal_code".to_string(),
+            ]),
+            additional_properties: None,
+        };
+
+        let mut order_props = BTreeMap::new();
+        order_props.insert(
+            "items".to_string(),
+            JsonSchema::Array {
+                items: Box::new(item_schema),
+                description: Some("Order line items.".to_string()),
+            },
+        );
+        order_props.insert("shipping".to_string(), shipping_schema);
+        order_props.insert(
+            "notes".to_string(),
+            JsonSchema::String {
+                description: Some("Optional delivery notes.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "create_order".to_string(),
+            description: "Create a mock order with items and shipping details.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties: order_props,
+                required: Some(vec!["items".to_string(), "shipping".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Tool spec for appending text to a file path.
+    fn append_file_tool() -> ToolSpec {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "path".to_string(),
+            JsonSchema::String {
+                description: Some("Path to write.".to_string()),
+            },
+        );
+        properties.insert(
+            "content".to_string(),
+            JsonSchema::String {
+                description: Some("Content to append.".to_string()),
+            },
+        );
+        properties.insert(
+            "mode".to_string(),
+            JsonSchema::String {
+                description: Some("Optional write mode, e.g. append.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "append_file".to_string(),
+            description: "Append text to a file path.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: Some(vec!["path".to_string(), "content".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Tool spec for issuing shell commands.
+    fn shell_tool() -> ToolSpec {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "command".to_string(),
+            JsonSchema::String {
+                description: Some("Command to execute.".to_string()),
+            },
+        );
+        properties.insert(
+            "timeout_ms".to_string(),
+            JsonSchema::Number {
+                description: Some("Optional timeout in ms.".to_string()),
+            },
+        );
+
+        ToolSpec::Function(ResponsesApiTool {
+            name: "shell".to_string(),
+            description: "Run a shell command.".to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: Some(vec!["command".to_string()]),
+                additional_properties: None,
+            },
+        })
+    }
+
+    /// Run a prompt against Gemini and collect the full event stream.
+    async fn execute_prompt(client: &ModelClient, prompt: Prompt) -> Result<Vec<ResponseEvent>> {
+        let mut stream = client.stream(&prompt).await?;
+        let mut events = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            events.push(event?);
+        }
+
+        Ok(events)
+    }
+
+    /// Pick the first function call from the stream and parse its JSON args.
+    fn extract_function_call(events: &[ResponseEvent]) -> Result<(String, Value)> {
+        let (name, args) = events
+            .iter()
+            .find_map(|event| match event {
+                ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                    name,
+                    arguments,
+                    ..
+                }) => Some((name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("response did not contain a function call"))?;
+
+        let parsed: Value = serde_json::from_str(&args)?;
+        Ok((name, parsed))
+    }
+
+    /// Coerce JSON numeric values into i64 for easier equality checks.
+    fn round_to_i64(value: &Value) -> Option<i64> {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|v| v.round() as i64))
+    }
+
+    /// Single prompt + expectation for the live Gemini matrix.
+    struct LiveCase {
+        name: &'static str,
+        prompt: String,
+        expected_tool: &'static str,
+        assert_args: Box<dyn Fn(&Value) + Send + Sync>,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn live_gemini_function_calls() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+        let Some(model) = should_run_live() else {
+            return Ok(());
+        };
+        let Some(LiveClient { client, .. }) = build_live_client(&model).await else {
+            return Ok(());
+        };
+
+        let tools = tool_catalog();
+        let cases = vec![
+            LiveCase {
+                name: "weather_paris",
+                prompt: "Use the get_weather(city, unit) function to fetch the weather for Paris in celsius. Respond only with a function call."
+                    .to_string(),
+                expected_tool: "get_weather",
+                assert_args: Box::new(|args| {
+                    let city = args
+                        .get("city")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    assert_eq!(city, "paris");
+
+                    let unit = args
+                        .get("unit")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let normalized = unit.to_lowercase();
+                    assert!(
+                        normalized.contains('c'),
+                        "expected Celsius unit, got {unit:?}"
+                    );
+                }),
+            },
+            LiveCase {
+                name: "stock_disambiguation",
+                prompt: "Choose the best tool to return the stock quote for AAPL. Tools available: get_weather(city, unit) and get_stock_quote(symbol). Return only the tool call."
+                    .to_string(),
+                expected_tool: "get_stock_quote",
+                assert_args: Box::new(|args| {
+                    let symbol = args
+                        .get("symbol")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_uppercase();
+                    assert_eq!(symbol, "AAPL");
+                }),
+            },
+            LiveCase {
+                name: "create_order_structured",
+                prompt: "Place an order via create_order(items, shipping, notes). Add 2 units of sku abc-123 and 1 unit of sku orange-456. Ship to Grace Hopper at 123 Harbor Road, Oakland, CA 94607. Delivery notes should say 'leave at front desk'. Respond only with a function call."
+                    .to_string(),
+                expected_tool: "create_order",
+                assert_args: Box::new(|args| {
+                    let empty_items = Vec::new();
+                    let items = args
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .unwrap_or(&empty_items);
+                    assert_eq!(items.len(), 2, "expected two items, got {items:?}");
+
+                    let first = items.first().unwrap_or(&Value::Null);
+                    assert_eq!(
+                        first.get("sku").and_then(Value::as_str),
+                        Some("abc-123")
+                    );
+                    let first_qty = first.get("quantity").and_then(round_to_i64);
+                    assert_eq!(first_qty, Some(2));
+
+                    let second = items.get(1).unwrap_or(&Value::Null);
+                    assert_eq!(
+                        second.get("sku").and_then(Value::as_str),
+                        Some("orange-456")
+                    );
+                    let second_qty = second.get("quantity").and_then(round_to_i64);
+                    assert_eq!(second_qty, Some(1));
+
+                    let empty_map = serde_json::Map::new();
+                    let shipping = args
+                        .get("shipping")
+                        .and_then(Value::as_object)
+                        .unwrap_or(&empty_map);
+                    assert_eq!(shipping.get("city").and_then(Value::as_str), Some("Oakland"));
+                    assert_eq!(shipping.get("state").and_then(Value::as_str), Some("CA"));
+                    assert_eq!(
+                        shipping.get("postal_code").and_then(Value::as_str),
+                        Some("94607")
+                    );
+                    assert_eq!(
+                        shipping.get("name").and_then(Value::as_str),
+                        Some("Grace Hopper")
+                    );
+
+                    if let Some(notes) = args.get("notes").and_then(Value::as_str) {
+                        assert!(
+                            notes.to_lowercase().contains("front"),
+                            "expected notes to mention delivery instructions"
+                        );
+                    }
+                }),
+            },
+            LiveCase {
+                name: "timer_normalization",
+                prompt: "Use the set_timer(minutes, label) function to start a timer for \"ten minuttes\" while I steep green tea. Normalize the duration to a numeric value in minutes and respond only with a function call."
+                    .to_string(),
+                expected_tool: "set_timer",
+                assert_args: Box::new(|args| {
+                    let minutes_value = args.get("minutes").unwrap_or(&Value::Null);
+                    let minutes = round_to_i64(minutes_value).unwrap_or_default();
+                    assert_eq!(minutes, 10);
+
+                    if let Some(label) = args.get("label").and_then(Value::as_str) {
+                        assert!(
+                            label.to_lowercase().contains("tea"),
+                            "expected label to mention tea"
+                        );
+                    }
+                }),
+            },
+            LiveCase {
+                name: "append_file",
+                prompt: "Call append_file(path, content, mode) to append 'hello from live' to /tmp/gemini-live.txt with mode \"append\". Respond only with a function call."
+                    .to_string(),
+                expected_tool: "append_file",
+                assert_args: Box::new(|args| {
+                    assert_eq!(
+                        args.get("path").and_then(Value::as_str),
+                        Some("/tmp/gemini-live.txt")
+                    );
+                    assert_eq!(
+                        args.get("content").and_then(Value::as_str),
+                        Some("hello from live")
+                    );
+                    assert_eq!(
+                        args.get("mode").and_then(Value::as_str),
+                        Some("append")
+                    );
+                }),
+            },
+            LiveCase {
+                name: "shell_ls",
+                prompt: "Call shell(command, timeout_ms) to list /tmp with a 2000ms timeout. Respond only with a function call."
+                    .to_string(),
+                expected_tool: "shell",
+                assert_args: Box::new(|args| {
+                    assert_eq!(args.get("command").and_then(Value::as_str), Some("ls /tmp"));
+                    let timeout = round_to_i64(args.get("timeout_ms").unwrap_or(&Value::Null)).unwrap_or(0);
+                    assert!(
+                        timeout >= 1_000 && timeout <= 10_000,
+                        "timeout should be reasonable, got {timeout}"
+                    );
+                }),
+            },
+            LiveCase {
+                name: "plan_create",
+                prompt: "Call update_plan(plan) to create a 2-step plan: step1='Collect files', step2='Summarize changes'. Mark step1 in_progress and step2 pending. Respond only with the function call."
+                    .to_string(),
+                expected_tool: "update_plan",
+                assert_args: Box::new(|args| {
+                    let steps = args
+                        .get("plan")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    assert_eq!(steps.len(), 2, "expected 2 plan items");
+                    let statuses: Vec<_> = steps
+                        .iter()
+                        .map(|s| s.get("status").and_then(Value::as_str).unwrap_or_default())
+                        .collect();
+                    assert_eq!(statuses[0], "in_progress");
+                    assert_eq!(statuses[1], "pending");
+                    let step_texts: Vec<_> = steps
+                        .iter()
+                        .map(|s| s.get("step").and_then(Value::as_str).unwrap_or_default())
+                        .collect();
+                    assert!(
+                        step_texts[0].to_lowercase().contains("collect"),
+                        "step 1 should mention collect"
+                    );
+                    assert!(
+                        step_texts[1].to_lowercase().contains("summarize"),
+                        "step 2 should mention summarize"
+                    );
+                }),
+            },
+            LiveCase {
+                name: "plan_update",
+                prompt: "Update the plan via update_plan: mark step1 completed, step2 in_progress, and add a pending step3 'Ship changes'. Respond only with the function call."
+                    .to_string(),
+                expected_tool: "update_plan",
+                assert_args: Box::new(|args| {
+                    let steps = args
+                        .get("plan")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    assert_eq!(steps.len(), 3, "expected 3 plan items");
+                    let statuses: Vec<_> = steps
+                        .iter()
+                        .map(|s| s.get("status").and_then(Value::as_str).unwrap_or_default())
+                        .collect();
+                    assert_eq!(statuses[0], "completed");
+                    assert_eq!(statuses[1], "in_progress");
+                    assert_eq!(statuses[2], "pending");
+                    let step3 = steps
+                        .get(2)
+                        .and_then(|s| s.get("step").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    assert!(
+                        step3.contains("ship"),
+                        "step 3 should mention ship changes, got {step3}"
+                    );
+                }),
+            },
+        ];
+
+        for case in cases {
+            let prompt = prompt_with_tools(&tools, &case.prompt);
+            println!(
+                "live_gemini sending case={} model={} prompt={}",
+                case.name, model, case.prompt
+            );
+            let events = execute_prompt(&client, prompt)
+                .await
+                .with_context(|| format!("case {} failed to stream from Gemini", case.name))?;
+            assert!(
+                events
+                    .iter()
+                    .any(|ev| matches!(ev, ResponseEvent::Completed { .. })),
+                "case {} did not finish the stream",
+                case.name
+            );
+
+            let (tool_name, args) =
+                extract_function_call(&events).with_context(|| format!("case {}", case.name))?;
+            assert_eq!(
+                tool_name, case.expected_tool,
+                "case {} should call the expected tool",
+                case.name
+            );
+            (case.assert_args)(&args);
+            println!(
+                "live_gemini case={} tool={} args={}",
+                case.name,
+                tool_name,
+                serde_json::to_string_pretty(&args).unwrap_or_else(|_| "<unprintable>".to_string())
+            );
+        }
+
+        Ok(())
     }
 }
 

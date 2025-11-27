@@ -80,6 +80,12 @@ pub struct ResumeConversationResponse {
     pub conversation_id: ConversationId,
     pub model: String,
     pub initial_messages: Option<Vec<EventMsg>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_messages_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_entry_count: Option<usize>,
     pub rollout_path: PathBuf,
 }
 
@@ -146,6 +152,10 @@ pub struct ResumeConversationParams {
     pub conversation_id: Option<ConversationId>,
     pub history: Option<Vec<ResponseItem>>,
     pub overrides: Option<NewConversationParams>,
+    /// When true, only a tail of the initial messages should be returned along with a cursor for paging older history.
+    pub initial_messages_tail: Option<bool>,
+    /// Number of turns to include when `initial_messages_tail` is enabled (applied to the most recent user-led turns).
+    pub initial_messages_limit: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -451,6 +461,10 @@ pub struct SessionConfiguredNotification {
     #[ts(type = "number")]
     pub history_entry_count: usize,
     pub initial_messages: Option<Vec<EventMsg>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_messages_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_cursor: Option<String>,
     pub rollout_path: PathBuf,
 }
 

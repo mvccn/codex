@@ -1137,6 +1137,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "base64",
+ "bytes",
  "chardetng",
  "chrono",
  "codex-api",

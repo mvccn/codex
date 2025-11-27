@@ -43,6 +43,7 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
+use crate::default_client::create_client;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
@@ -136,10 +137,11 @@ impl ModelClient {
                 }
             }
             WireApi::Gemini => {
+                let client = create_client();
                 stream_gemini(
                     prompt,
                     &self.config.model_family,
-                    &self.client,
+                    &client,
                     &self.provider,
                     &self.otel_event_manager,
                     &self.session_source,

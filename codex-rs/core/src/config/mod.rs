@@ -1130,10 +1130,11 @@ impl Config {
         // This lets users switch between `models/gemini-2.5-flash` and
         // `models/gemini-3-pro-preview` without duplicating URL patterns in
         // their config file or wrapper scripts.
-        if model_provider.base_url.is_none() && model_provider.wire_api == crate::WireApi::Gemini {
-            if let Some(url) = crate::gemini_models::default_gemini_generate_url(&model) {
-                model_provider.base_url = Some(url);
-            }
+        if model_provider.base_url.is_none()
+            && model_provider.wire_api == crate::WireApi::Gemini
+            && let Some(url) = crate::gemini_models::default_gemini_generate_url(&model)
+        {
+            model_provider.base_url = Some(url);
         }
 
         let openai_model_info = get_model_info(&model_family);

@@ -117,6 +117,27 @@ const GEMINI_MODELS: &[GeminiModelInfo] = &[
         endpoint_suffix_generate: ":generateContent",
         endpoint_suffix_stream: ":streamGenerateContent",
     },
+    GeminiModelInfo {
+        id: "gemini-3.0-pro",
+        aliases: &["gemini-3.0-pro", "models/gemini-3.0-pro"],
+        description: "Gemini 3.0 Pro: stable next‑gen Pro model with full tool support.",
+        capabilities: GeminiCapabilities {
+            batch_api: true,
+            caching: true,
+            code_execution: true,
+            file_search: true,
+            function_calling: true,
+            grounding_with_google_maps: false,
+            image_generation: false,
+            live_api: false,
+            search_grounding: true,
+            structured_outputs: true,
+            thinking: true,
+            url_context: true,
+        },
+        endpoint_suffix_generate: ":generateContent",
+        endpoint_suffix_stream: ":streamGenerateContent",
+    },
 ];
 
 /// Returns static metadata for a Gemini model slug, if known.
@@ -238,6 +259,26 @@ mod tests {
         assert!(
             stream_url.ends_with("models/gemini-2.5-flash:streamGenerateContent"),
             "unexpected streamGenerateContent URL: {stream_url}"
+        );
+        assert_eq!(params.get("alt").map(String::as_str), Some("sse"));
+    }
+
+    #[test]
+    fn default_urls_cover_gemini_three_pro() {
+        let info = find_gemini_model("models/gemini-3.0-pro").expect("model info");
+        assert_eq!(info.id, "gemini-3.0-pro");
+
+        let url = default_gemini_generate_url("gemini-3.0-pro").expect("url");
+        assert!(
+            url.ends_with("models/gemini-3.0-pro:generateContent"),
+            "unexpected generateContent URL for gemini-3.0-pro: {url}"
+        );
+
+        let (stream_url, params) =
+            default_gemini_streaming_url("gemini-3.0-pro").expect("stream url");
+        assert!(
+            stream_url.ends_with("models/gemini-3.0-pro:streamGenerateContent"),
+            "unexpected streamGenerateContent URL for gemini-3.0-pro: {stream_url}"
         );
         assert_eq!(params.get("alt").map(String::as_str), Some("sse"));
     }

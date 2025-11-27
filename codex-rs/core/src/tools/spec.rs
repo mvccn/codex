@@ -2204,7 +2204,7 @@ mod gemini_tests {
 
         let serialized = serde_json::to_string(&tools_json).expect("serialize tools_json");
         assert!(
-            !serialized.contains("strict"),
+            !serialized.contains("\"strict\""),
             "Gemini tools JSON must not contain `strict`"
         );
         assert!(

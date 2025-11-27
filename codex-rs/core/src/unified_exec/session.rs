@@ -144,6 +144,21 @@ impl UnifiedExecSession {
         self.session.exit_code()
     }
 
+    /// Wait for the process to exit for at most `max_wait`, returning whether it exited.
+    pub(super) async fn wait_for_exit_within(&self, max_wait: Duration) -> bool {
+        if self.has_exited() {
+            return true;
+        }
+
+        let cancelled = self.cancellation_token.cancelled();
+        tokio::pin!(cancelled);
+        if tokio::time::timeout(max_wait, &mut cancelled).await.is_ok() {
+            true
+        } else {
+            self.has_exited()
+        }
+    }
+
     async fn snapshot_output(&self) -> Vec<Vec<u8>> {
         let guard = self.output_buffer.lock().await;
         guard.snapshot()
