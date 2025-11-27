@@ -800,10 +800,58 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
         .expect("Gemini follow-up request body should be JSON");
     let contents = payload["contents"].as_array().cloned().unwrap_or_default();
 
+    let function_call_entry = contents
+        .iter()
+        .find(|c| {
+            c["parts"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part.get("functionCall").is_some()))
+        })
+        .expect("functionCall part missing from Gemini payload");
+    assert_eq!(
+        function_call_entry["role"],
+        json!("model"),
+        "functionCall should be emitted as a model role entry"
+    );
+    let function_call = function_call_entry["parts"][0]["functionCall"]
+        .as_object()
+        .expect("functionCall shape");
+    assert_eq!(
+        function_call.get("name"),
+        Some(&json!("write_file")),
+        "functionCall should include the function name"
+    );
+    assert_eq!(
+        function_call_entry["parts"][0].get("thought_signature"),
+        Some(&json!("codex_thought_sig_call-1")),
+        "functionCall part should carry a thought signature"
+    );
+    let call_args = function_call
+        .get("args")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        call_args.get("path"),
+        Some(&json!("/tmp/demo.txt")),
+        "functionCall should include arguments"
+    );
+
     let function_entry = contents
         .iter()
-        .find(|c| c["role"] == json!("function"))
+        .find(|c| {
+            c["parts"].as_array().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("functionResponse").is_some())
+            })
+        })
         .expect("functionResponse part missing from Gemini payload");
+    assert_eq!(
+        function_entry["role"],
+        json!("user"),
+        "functionResponse payloads should be wrapped as a user role entry"
+    );
     let function_response = function_entry["parts"][0]["functionResponse"]
         .as_object()
         .expect("functionResponse shape");
@@ -811,6 +859,11 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
         function_response.get("name"),
         Some(&json!("write_file")),
         "functionResponse should include the function name"
+    );
+    assert_eq!(
+        function_entry["parts"][0].get("thought_signature"),
+        Some(&json!("codex_thought_sig_call-1")),
+        "functionResponse part should echo the thought signature"
     );
     let function_content_text = function_response
         .get("response")

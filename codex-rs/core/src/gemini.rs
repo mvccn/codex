@@ -371,6 +371,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
     let mut current_role: Option<String> = None;
     let mut current_parts: Vec<Value> = Vec::new();
     let mut function_call_names: HashMap<String, String> = HashMap::new();
+    let mut function_call_signatures: HashMap<String, String> = HashMap::new();
 
     let flush = |role: &mut Option<String>, parts: &mut Vec<Value>, contents: &mut Vec<Value>| {
         if parts.is_empty() {
@@ -415,18 +416,44 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                     }
                 }
             }
-            ResponseItem::FunctionCall { name, call_id, .. } => {
+            ResponseItem::FunctionCall {
+                name,
+                call_id,
+                arguments,
+                ..
+            } => {
                 function_call_names.insert(call_id.clone(), name.clone());
+                let thought_signature = format!("codex_thought_sig_{call_id}");
+                function_call_signatures.insert(call_id.clone(), thought_signature.clone());
+
+                if current_role.as_deref() != Some("model") {
+                    flush(&mut current_role, &mut current_parts, &mut contents);
+                    current_role = Some("model".to_string());
+                }
+
+                let args_json = serde_json::from_str(arguments).unwrap_or_else(|e| {
+                    debug!("Failed to parse function call args for {name}: {e}");
+                    Value::Null
+                });
+
+                current_parts.push(json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": args_json,
+                    },
+                    "thought_signature": thought_signature,
+                }));
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 let function_name = function_call_names
                     .get(call_id)
                     .cloned()
                     .unwrap_or_else(|| call_id.clone());
+                let thought_signature = function_call_signatures.get(call_id).cloned();
 
-                if current_role.as_deref() != Some("function") {
+                if current_role.as_deref() != Some("user") {
                     flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some("function".to_string());
+                    current_role = Some("user".to_string());
                 }
 
                 let mut response_content: Vec<Value> = Vec::new();
@@ -449,7 +476,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                     response_content.push(json!({ "text": output.content }));
                 }
 
-                current_parts.push(json!({
+                let mut function_response = json!({
                     "functionResponse": {
                         "name": function_name,
                         "response": {
@@ -457,7 +484,13 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                             "content": response_content,
                         },
                     },
-                }));
+                });
+
+                if let Some(signature) = thought_signature {
+                    function_response["thought_signature"] = json!(signature);
+                }
+
+                current_parts.push(function_response);
             }
             ResponseItem::CustomToolCallOutput { call_id, output } => {
                 if current_role.as_deref() != Some("user") {
