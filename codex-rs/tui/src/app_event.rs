@@ -60,10 +60,14 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Update the current model provider in the running app and widget.
+    UpdateModelProvider(String),
+
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
         model: String,
         effort: Option<ReasoningEffort>,
+        provider_id: Option<String>,
     },
 
     /// Open the reasoning selection popup after picking a model.

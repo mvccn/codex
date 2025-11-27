@@ -31,6 +31,8 @@ pub struct ModelPreset {
     pub id: &'static str,
     /// Model slug (e.g., "gpt-5").
     pub model: &'static str,
+    /// Optional provider id to use when selecting this preset.
+    pub provider_id: Option<&'static str>,
     /// Display name shown in UIs.
     pub display_name: &'static str,
     /// Short human description shown in UIs.
@@ -52,6 +54,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5.1-codex-max",
             model: "gpt-5.1-codex-max",
+            provider_id: None,
             display_name: "gpt-5.1-codex-max",
             description: "Latest Codex-optimized flagship for deep and fast reasoning.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -80,6 +83,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5.1-codex",
             model: "gpt-5.1-codex",
+            provider_id: None,
             display_name: "gpt-5.1-codex",
             description: "Optimized for codex.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -108,6 +112,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5.1-codex-mini",
             model: "gpt-5.1-codex-mini",
+            provider_id: None,
             display_name: "gpt-5.1-codex-mini",
             description: "Optimized for codex. Cheaper, faster, but less capable.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -132,6 +137,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5.1",
             model: "gpt-5.1",
+            provider_id: None,
             display_name: "gpt-5.1",
             description: "Broad world knowledge with strong general reasoning.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -161,6 +167,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5-codex",
             model: "gpt-5-codex",
+            provider_id: None,
             display_name: "gpt-5-codex",
             description: "Optimized for codex.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -189,6 +196,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5-codex-mini",
             model: "gpt-5-codex-mini",
+            provider_id: None,
             display_name: "gpt-5-codex-mini",
             description: "Optimized for codex. Cheaper, faster, but less capable.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -213,6 +221,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
         ModelPreset {
             id: "gpt-5",
             model: "gpt-5",
+            provider_id: None,
             display_name: "gpt-5",
             description: "Broad world knowledge with strong general reasoning.",
             default_reasoning_effort: ReasoningEffort::Medium,
@@ -241,6 +250,56 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                 migration_config_key: HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG,
             }),
             show_in_picker: false,
+        },
+        ModelPreset {
+            id: "gemini-2.5-flash",
+            model: "models/gemini-2.5-flash",
+            provider_id: Some("gemini-25-sse"),
+            display_name: "Gemini 2.5 Flash",
+            description: "Google Gemini: fast, cost-efficient coding/general model.",
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: &[
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Low,
+                    description: "Prioritize latency for quick replies",
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning and speed",
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::High,
+                    description: "Deeper reasoning for trickier tasks",
+                },
+            ],
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+        },
+        ModelPreset {
+            id: "gemini-3-pro-preview",
+            model: "models/gemini-3-pro-preview",
+            provider_id: Some("gemini-30-sse"),
+            display_name: "Gemini 3 Pro Preview",
+            description: "Google Gemini: latest Pro preview for rich reasoning.",
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: &[
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Low,
+                    description: "Prioritize latency for quick replies",
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning and speed",
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::High,
+                    description: "Deeper reasoning for trickier tasks",
+                },
+            ],
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
         },
     ]
 });

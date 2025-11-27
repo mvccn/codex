@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use codex_app_server_protocol::AuthMode;
 use codex_backend_client::Client as BackendClient;
+use codex_core::ModelProviderInfo;
 use codex_core::config::Config;
 use codex_core::config::types::Notifications;
 use codex_core::git_info::current_branch_name;
@@ -2017,6 +2018,7 @@ impl ChatWidget {
     fn open_rate_limit_switch_prompt(&mut self, preset: ModelPreset) {
         let switch_model = preset.model.to_string();
         let display_name = preset.display_name.to_string();
+        let provider_id = preset.provider_id.map(std::string::ToString::to_string);
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
 
         let switch_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
@@ -2024,10 +2026,14 @@ impl ChatWidget {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                model_provider_id: provider_id.clone(),
                 model: Some(switch_model.clone()),
                 effort: Some(Some(default_effort)),
                 summary: None,
             }));
+            if let Some(provider_id) = provider_id.clone() {
+                tx.send(AppEvent::UpdateModelProvider(provider_id));
+            }
             tx.send(AppEvent::UpdateModel(switch_model.clone()));
             tx.send(AppEvent::UpdateReasoningEffort(Some(default_effort)));
         })];
@@ -2133,6 +2139,7 @@ impl ChatWidget {
     pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
         let supported = preset.supported_reasoning_efforts;
+        let provider_id = preset.provider_id.map(std::string::ToString::to_string);
 
         let warn_effort = if supported
             .iter()
@@ -2176,9 +2183,9 @@ impl ChatWidget {
 
         if choices.len() == 1 {
             if let Some(effort) = choices.first().and_then(|c| c.stored) {
-                self.apply_model_and_effort(preset.model.to_string(), Some(effort));
+                self.apply_model_and_effort(preset.model.to_string(), Some(effort), provider_id);
             } else {
-                self.apply_model_and_effort(preset.model.to_string(), None);
+                self.apply_model_and_effort(preset.model.to_string(), None, provider_id);
             }
             return;
         }
@@ -2238,20 +2245,26 @@ impl ChatWidget {
 
             let model_for_action = model_slug.clone();
             let effort_for_action = choice.stored;
+            let provider_for_action = provider_id.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
                     cwd: None,
                     approval_policy: None,
                     sandbox_policy: None,
+                    model_provider_id: provider_for_action.clone(),
                     model: Some(model_for_action.clone()),
                     effort: Some(effort_for_action),
                     summary: None,
                 }));
+                if let Some(provider_id) = provider_for_action.clone() {
+                    tx.send(AppEvent::UpdateModelProvider(provider_id));
+                }
                 tx.send(AppEvent::UpdateModel(model_for_action.clone()));
                 tx.send(AppEvent::UpdateReasoningEffort(effort_for_action));
                 tx.send(AppEvent::PersistModelSelection {
                     model: model_for_action.clone(),
                     effort: effort_for_action,
+                    provider_id: provider_for_action.clone(),
                 });
                 tracing::info!(
                     "Selected model: {}, Selected effort: {}",
@@ -2298,22 +2311,33 @@ impl ChatWidget {
         }
     }
 
-    fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
+    fn apply_model_and_effort(
+        &self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+        provider_id: Option<String>,
+    ) {
         self.app_event_tx
             .send(AppEvent::CodexOp(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                model_provider_id: provider_id.clone(),
                 model: Some(model.clone()),
                 effort: Some(effort),
                 summary: None,
             }));
+        if let Some(provider_id) = provider_id.clone() {
+            self.app_event_tx
+                .send(AppEvent::UpdateModelProvider(provider_id));
+        }
         self.app_event_tx.send(AppEvent::UpdateModel(model.clone()));
         self.app_event_tx
             .send(AppEvent::UpdateReasoningEffort(effort));
         self.app_event_tx.send(AppEvent::PersistModelSelection {
             model: model.clone(),
             effort,
+            provider_id,
         });
         tracing::info!(
             "Selected model: {}, Selected effort: {}",
@@ -2411,6 +2435,7 @@ impl ChatWidget {
                 cwd: None,
                 approval_policy: Some(approval),
                 sandbox_policy: Some(sandbox_clone.clone()),
+                model_provider_id: None,
                 model: None,
                 effort: None,
                 summary: None,
@@ -2773,6 +2798,12 @@ impl ChatWidget {
     pub(crate) fn set_model(&mut self, model: &str) {
         self.session_header.set_model(model);
         self.config.model = model.to_string();
+    }
+
+    /// Set the model provider in the widget's config copy.
+    pub(crate) fn set_model_provider(&mut self, provider_id: &str, provider: &ModelProviderInfo) {
+        self.config.model_provider_id = provider_id.to_string();
+        self.config.model_provider = provider.clone();
     }
 
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {

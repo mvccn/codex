@@ -1716,6 +1716,7 @@ fn single_reasoning_option_skips_selection() {
     let preset = ModelPreset {
         id: "model-with-single-reasoning",
         model: "model-with-single-reasoning",
+        provider_id: None,
         display_name: "model-with-single-reasoning",
         description: "",
         default_reasoning_effort: ReasoningEffortConfig::High,

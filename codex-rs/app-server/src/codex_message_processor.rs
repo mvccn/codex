@@ -1934,6 +1934,7 @@ impl CodexMessageProcessor {
             conversation_id,
             history,
             overrides,
+            ..
         } = params;
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
@@ -2084,6 +2085,8 @@ impl CodexMessageProcessor {
                             history_log_id: session_configured.history_log_id,
                             history_entry_count: session_configured.history_entry_count,
                             initial_messages: session_configured.initial_messages.clone(),
+                            initial_messages_truncated: None,
+                            history_cursor: None,
                             rollout_path: session_configured.rollout_path.clone(),
                         },
                     ))
@@ -2097,6 +2100,9 @@ impl CodexMessageProcessor {
                     conversation_id,
                     model: session_configured.model.clone(),
                     initial_messages,
+                    initial_messages_truncated: None,
+                    history_cursor: None,
+                    history_entry_count: Some(session_configured.history_entry_count),
                     rollout_path: session_configured.rollout_path.clone(),
                 };
                 self.outgoing.send_response(request_id, response).await;
@@ -2452,6 +2458,7 @@ impl CodexMessageProcessor {
                     cwd: params.cwd,
                     approval_policy: params.approval_policy.map(AskForApproval::to_core),
                     sandbox_policy: params.sandbox_policy.map(|p| p.to_core()),
+                    model_provider_id: None,
                     model: params.model,
                     effort: params.effort.map(Some),
                     summary: params.summary,

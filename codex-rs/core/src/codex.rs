@@ -176,6 +176,7 @@ impl Codex {
         let config = Arc::new(config);
 
         let session_configuration = SessionConfiguration {
+            provider_id: config.model_provider_id.clone(),
             provider: config.model_provider.clone(),
             model: config.model.clone(),
             model_reasoning_effort: config.model_reasoning_effort,
@@ -308,6 +309,7 @@ impl TurnContext {
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
     /// Provider identifier ("openai", "openrouter", ...).
+    provider_id: String,
     provider: ModelProviderInfo,
 
     /// If not specified, server will use its default model.
@@ -359,6 +361,20 @@ impl SessionConfiguration {
         if let Some(model) = updates.model.clone() {
             next_configuration.model = model;
         }
+        if let Some(provider_id) = updates.model_provider_id.clone() {
+            if let Some(provider) = self
+                .original_config_do_not_use
+                .model_providers
+                .get(&provider_id)
+            {
+                next_configuration.provider_id = provider_id;
+                next_configuration.provider = provider.clone();
+            } else {
+                warn!(
+                    "Requested model provider `{provider_id}` not found; keeping current provider"
+                );
+            }
+        }
         if let Some(effort) = updates.reasoning_effort {
             next_configuration.model_reasoning_effort = effort;
         }
@@ -383,6 +399,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) approval_policy: Option<AskForApproval>,
     pub(crate) sandbox_policy: Option<SandboxPolicy>,
+    pub(crate) model_provider_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<Option<ReasoningEffortConfig>>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
@@ -406,6 +423,8 @@ impl Session {
         per_turn_config.model_family = model_family.clone();
         per_turn_config.model_reasoning_effort = session_configuration.model_reasoning_effort;
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
+        per_turn_config.model_provider_id = session_configuration.provider_id.clone();
+        per_turn_config.model_provider = session_configuration.provider.clone();
         if let Some(model_info) = get_model_info(&model_family) {
             per_turn_config.model_context_window = Some(model_info.context_window);
         }
@@ -587,7 +606,7 @@ impl Session {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: conversation_id,
                 model: session_configuration.model.clone(),
-                model_provider_id: config.model_provider_id.clone(),
+                model_provider_id: session_configuration.provider_id.clone(),
                 approval_policy: session_configuration.approval_policy,
                 sandbox_policy: session_configuration.sandbox_policy.clone(),
                 cwd: session_configuration.cwd.clone(),
@@ -1394,6 +1413,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 cwd,
                 approval_policy,
                 sandbox_policy,
+                model_provider_id,
                 model,
                 effort,
                 summary,
@@ -1404,6 +1424,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                         cwd,
                         approval_policy,
                         sandbox_policy,
+                        model_provider_id,
                         model,
                         reasoning_effort: effort,
                         reasoning_summary: summary,
@@ -1533,6 +1554,7 @@ mod handlers {
                     cwd: Some(cwd),
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
+                    model_provider_id: None,
                     model: Some(model),
                     reasoning_effort: Some(effort),
                     reasoning_summary: Some(summary),
@@ -2664,6 +2686,7 @@ mod tests {
         );
 
         let session_configuration = SessionConfiguration {
+            provider_id: config.model_provider_id.clone(),
             provider: config.model_provider.clone(),
             model: config.model.clone(),
             model_reasoning_effort: config.model_reasoning_effort,
@@ -2742,6 +2765,7 @@ mod tests {
         );
 
         let session_configuration = SessionConfiguration {
+            provider_id: config.model_provider_id.clone(),
             provider: config.model_provider.clone(),
             model: config.model.clone(),
             model_reasoning_effort: config.model_reasoning_effort,

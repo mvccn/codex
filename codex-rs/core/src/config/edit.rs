@@ -22,6 +22,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active (or default) model provider selection.
+    SetModelProvider { model_provider: Option<String> },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -240,6 +242,14 @@ impl ConfigDocument {
                     effort.map(|effort| value(effort.to_string())),
                 );
                 mutated
+            }),
+            ConfigEdit::SetModelProvider { model_provider } => Ok({
+                self.write_profile_value(
+                    &["model_provider"],
+                    model_provider
+                        .as_ref()
+                        .map(|provider| value(provider.clone())),
+                )
             }),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
@@ -495,6 +505,13 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_model_provider(mut self, model_provider: Option<&str>) -> Self {
+        self.edits.push(ConfigEdit::SetModelProvider {
+            model_provider: model_provider.map(ToOwned::to_owned),
+        });
+        self
+    }
+
     pub fn set_hide_full_access_warning(mut self, acknowledged: bool) -> Self {
         self.edits
             .push(ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged));
@@ -599,6 +616,27 @@ mod tests {
             std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
         let expected = r#"model = "gpt-5.1-codex"
 model_reasoning_effort = "high"
+"#;
+        assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn blocking_set_model_provider_top_level() {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+
+        apply_blocking(
+            codex_home,
+            None,
+            &[ConfigEdit::SetModelProvider {
+                model_provider: Some("gemini-2-5".to_string()),
+            }],
+        )
+        .expect("persist");
+
+        let contents =
+            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let expected = r#"model_provider = "gemini-2-5"
 "#;
         assert_eq!(contents, expected);
     }

@@ -172,6 +172,7 @@ async fn handle_model_migration_prompt_if_needed(
                 app_event_tx.send(AppEvent::PersistModelSelection {
                     model: target_model.clone(),
                     effort: mapped_effort,
+                    provider_id: None,
                 });
             }
             ModelMigrationOutcome::Rejected => {
@@ -569,6 +570,17 @@ impl App {
                     self.config.model_family = family;
                 }
             }
+            AppEvent::UpdateModelProvider(provider_id) => {
+                if let Some(provider) = self.config.model_providers.get(&provider_id) {
+                    self.config.model_provider_id = provider_id.clone();
+                    self.config.model_provider = provider.clone();
+                    self.chat_widget.set_model_provider(&provider_id, provider);
+                } else {
+                    self.chat_widget.add_error_message(format!(
+                        "Unknown model provider `{provider_id}`; keeping current provider."
+                    ));
+                }
+            }
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
             }
@@ -631,6 +643,7 @@ impl App {
                                         cwd: None,
                                         approval_policy: Some(preset.approval),
                                         sandbox_policy: Some(preset.sandbox.clone()),
+                                        model_provider_id: None,
                                         model: None,
                                         effort: None,
                                         summary: None,
@@ -662,14 +675,19 @@ impl App {
                     let _ = preset;
                 }
             }
-            AppEvent::PersistModelSelection { model, effort } => {
+            AppEvent::PersistModelSelection {
+                model,
+                effort,
+                provider_id,
+            } => {
                 let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_model(Some(model.as_str()), effort)
-                    .apply()
-                    .await
-                {
+                let mut builder =
+                    ConfigEditsBuilder::new(&self.config.codex_home).with_profile(profile);
+                builder = builder.set_model(Some(model.as_str()), effort);
+                if let Some(provider_id) = provider_id.as_deref() {
+                    builder = builder.set_model_provider(Some(provider_id));
+                }
+                match builder.apply().await {
                     Ok(()) => {
                         let reasoning_label = Self::reasoning_label(effort);
                         if let Some(profile) = profile {
