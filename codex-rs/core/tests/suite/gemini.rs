@@ -135,7 +135,12 @@ async fn gemini_non_streaming_round_trip_and_payload_shape() {
                     "role": "model"
                 }
             }
-        ]
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 3,
+            "candidatesTokenCount": 2,
+            "totalTokenCount": 5
+        }
     });
 
     Mock::given(method("POST"))
@@ -168,6 +173,18 @@ async fn gemini_non_streaming_round_trip_and_payload_shape() {
         assistant_text.contains("Hello from Gemini"),
         "assistant text should come from Gemini response, got {assistant_text:?}"
     );
+
+    let completed_usage = events.iter().find_map(|ev| {
+        if let ResponseEvent::Completed { token_usage, .. } = ev {
+            token_usage.clone()
+        } else {
+            None
+        }
+    });
+    let usage = completed_usage.expect("token usage should be present");
+    assert_eq!(usage.input_tokens, 3);
+    assert_eq!(usage.output_tokens, 2);
+    assert_eq!(usage.total_tokens, 5);
 
     let requests = server
         .received_requests()
@@ -207,6 +224,8 @@ data: {\"result\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}
 \n\
 data: {\"result\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}]}}]}}\n\
 \n\
+data: {\"result\":{\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":3,\"totalTokenCount\":7}}}\n\
+\n\
 data: [DONE]\n\
 \n";
 
@@ -244,6 +263,18 @@ data: [DONE]\n\
         assistant_text.contains("Hello world"),
         "expected concatenated streaming text, got {assistant_text:?}"
     );
+
+    let completed_usage = events.iter().find_map(|ev| {
+        if let ResponseEvent::Completed { token_usage, .. } = ev {
+            token_usage.clone()
+        } else {
+            None
+        }
+    });
+    let usage = completed_usage.expect("token usage should be present");
+    assert_eq!(usage.input_tokens, 4);
+    assert_eq!(usage.output_tokens, 3);
+    assert_eq!(usage.total_tokens, 7);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -682,12 +713,34 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
     let payload: Value = requests[0]
         .body_json()
         .expect("Gemini follow-up request body should be JSON");
-    let body = serde_json::to_string(&payload).expect("serialize payload");
+    let contents = payload["contents"].as_array().cloned().unwrap_or_default();
 
-    assert!(
-        body.contains("Tool call-1 result:\\nfile saved"),
-        "expected function call output to be included in contents"
+    let function_entry = contents
+        .iter()
+        .find(|c| c["role"] == json!("function"))
+        .expect("functionResponse part missing from Gemini payload");
+    let function_response = function_entry["parts"][0]["functionResponse"]
+        .as_object()
+        .expect("functionResponse shape");
+    assert_eq!(
+        function_response.get("name"),
+        Some(&json!("write_file")),
+        "functionResponse should include the function name"
     );
+    let function_content_text = function_response
+        .get("response")
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        function_content_text.contains("file saved"),
+        "functionResponse should carry the tool output"
+    );
+
+    let body = serde_json::to_string(&payload).expect("serialize payload");
     assert!(
         body.contains("Custom tool call-2 result:\\nexec done"),
         "expected custom tool call output to be included in contents"

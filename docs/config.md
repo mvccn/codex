@@ -89,7 +89,11 @@ base_url = "https://api.openai.com/v1"
 # using Codex with this provider. The value of the environment variable must be
 # non-empty and will be used in the `Bearer TOKEN` HTTP header for the POST request.
 env_key = "OPENAI_API_KEY"
-# Valid values for wire_api are "chat" and "responses". Defaults to "chat" if omitted.
+# Valid values for wire_api are:
+#   - "chat"      (OpenAI Chat Completions compatible)
+#   - "responses" (OpenAI Responses API compatible)
+#   - "gemini"    (native Gemini adapter; base_url must be the full streaming endpoint)
+# Defaults to "chat" if omitted.
 wire_api = "chat"
 # If necessary, extra query params that need to be added to the URL.
 # See the Azure example below.
@@ -961,7 +965,7 @@ Valid values:
 | `model_providers.<id>.name`                      | string                                                            | Display name.                                                                                                              |
 | `model_providers.<id>.base_url`                  | string                                                            | API base URL.                                                                                                              |
 | `model_providers.<id>.env_key`                   | string                                                            | Env var for API key.                                                                                                       |
-| `model_providers.<id>.wire_api`                  | `chat` \| `responses`                                             | Protocol used (default: `chat`).                                                                                           |
+| `model_providers.<id>.wire_api`                  | `chat` \| `responses` \| `gemini`                                 | Protocol used (default: `chat`). `gemini` selects the native Gemini adapter and expects `base_url` to be a full streaming endpoint. |
 | `model_providers.<id>.query_params`              | map<string,string>                                                | Extra query params (e.g., Azure `api-version`).                                                                            |
 | `model_providers.<id>.http_headers`              | map<string,string>                                                | Additional static headers.                                                                                                 |
 | `model_providers.<id>.env_http_headers`          | map<string,string>                                                | Headers sourced from env vars.                                                                                             |

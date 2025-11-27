@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,12 @@ use crate::tools::spec::create_tools_json_for_gemini_api;
 use bytes::Bytes;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::Stream;
 use futures::StreamExt;
@@ -63,6 +68,8 @@ async fn process_gemini_sse<S>(
 {
     let mut stream = stream.eventsource();
     let mut assistant_item: Option<ResponseItem> = None;
+    let mut reasoning_item: Option<ResponseItem> = None;
+    let mut token_usage: Option<TokenUsage> = None;
 
     loop {
         let response = timeout(idle_timeout, stream.next()).await;
@@ -80,10 +87,13 @@ async fn process_gemini_sse<S>(
                 if let Some(item) = assistant_item.take() {
                     let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }
+                if let Some(item) = reasoning_item.take() {
+                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                }
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id: String::new(),
-                        token_usage: None,
+                        token_usage: token_usage.clone(),
                     }))
                     .await;
                 return;
@@ -108,10 +118,13 @@ async fn process_gemini_sse<S>(
             if let Some(item) = assistant_item.take() {
                 let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
             }
+            if let Some(item) = reasoning_item.take() {
+                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            }
             let _ = tx_event
                 .send(Ok(ResponseEvent::Completed {
                     response_id: String::new(),
-                    token_usage: None,
+                    token_usage: token_usage.clone(),
                 }))
                 .await;
             return;
@@ -126,9 +139,22 @@ async fn process_gemini_sse<S>(
         };
 
         let payload = chunk.get("result").cloned().unwrap_or(chunk);
+        if let Some(usage) = extract_token_usage(&payload) {
+            token_usage = Some(usage);
+        }
         let parsed = parse_gemini_response(&payload);
+        let ParsedGeminiResponse {
+            text,
+            function_calls,
+            reasoning,
+        } = parsed;
 
-        if let Some(text) = parsed.text {
+        if let Some(reasoning) = reasoning
+            && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning).await {
+                return;
+            }
+
+        if let Some(text) = text {
             if append_assistant_text(&tx_event, &mut assistant_item, text).await {
                 continue;
             } else {
@@ -136,17 +162,26 @@ async fn process_gemini_sse<S>(
             }
         }
 
-        if !parsed.function_calls.is_empty() {
+        if !function_calls.is_empty() {
             if let Some(item) = assistant_item.take()
                 && tx_event
                     .send(Ok(ResponseEvent::OutputItemDone(item)))
                     .await
                     .is_err()
-            {
-                return;
-            }
+                {
+                    return;
+                }
 
-            for (idx, fc) in parsed.function_calls.into_iter().enumerate() {
+            if let Some(item) = reasoning_item.take()
+                && tx_event
+                    .send(Ok(ResponseEvent::OutputItemDone(item)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+            for (idx, fc) in function_calls.into_iter().enumerate() {
                 let call_id = format!("gemini_call_{}", idx + 1);
                 let arguments = match serde_json::to_string(&fc.args) {
                     Ok(s) => s,
@@ -175,7 +210,7 @@ async fn process_gemini_sse<S>(
             let _ = tx_event
                 .send(Ok(ResponseEvent::Completed {
                     response_id: String::new(),
-                    token_usage: None,
+                    token_usage: token_usage.clone(),
                 }))
                 .await;
             return;
@@ -195,11 +230,80 @@ struct GeminiFunctionCall {
 struct ParsedGeminiResponse {
     text: Option<String>,
     function_calls: Vec<GeminiFunctionCall>,
+    reasoning: Option<String>,
+}
+
+fn extract_token_usage(root: &Value) -> Option<TokenUsage> {
+    let usage = root
+        .get("usageMetadata")
+        .or_else(|| root.get("result").and_then(|v| v.get("usageMetadata")))?;
+
+    let input_tokens = usage
+        .get("promptTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("candidatesTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        ..Default::default()
+    })
+}
+
+fn safety_settings_allow_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_NONE",
+        }),
+        json!({
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": "BLOCK_NONE",
+        }),
+        json!({
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_NONE",
+        }),
+        json!({
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": "BLOCK_NONE",
+        }),
+        json!({
+            "category": "HARM_CATEGORY_VIOLENCE",
+            "threshold": "BLOCK_NONE",
+        }),
+    ]
+}
+
+fn extract_text_value(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+
+    if value.is_null() {
+        return None;
+    }
+
+    serde_json::to_string(value).ok()
 }
 
 fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
     let mut text: Option<String> = None;
     let mut function_calls: Vec<GeminiFunctionCall> = Vec::new();
+    let mut reasoning: Option<String> = None;
 
     // Preferred path: candidates[0].content.parts[*]
     if let Some(candidates) = root.get("candidates").and_then(|v| v.as_array())
@@ -212,6 +316,12 @@ fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
                 buf.push_str(t);
             }
+
+            if let Some(thought_val) = part.get("thought")
+                && let Some(thought_text) = extract_text_value(thought_val) {
+                    let entry = reasoning.get_or_insert_with(String::new);
+                    entry.push_str(&thought_text);
+                }
 
             if let Some(fc_val) = part
                 .get("functionCall")
@@ -247,6 +357,7 @@ fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
     ParsedGeminiResponse {
         text,
         function_calls,
+        reasoning,
     }
 }
 
@@ -254,11 +365,12 @@ fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
 /// best‑effort mapping that:
 ///   * preserves the user/assistant roles where possible
 ///   * encodes text as `parts[{text: ...}]`
-///   * flattens tool outputs into user-visible text snippets
+///   * returns tool outputs as Gemini `functionResponse` parts
 fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
     let mut contents: Vec<Value> = Vec::new();
     let mut current_role: Option<String> = None;
     let mut current_parts: Vec<Value> = Vec::new();
+    let mut function_call_names: HashMap<String, String> = HashMap::new();
 
     let flush = |role: &mut Option<String>, parts: &mut Vec<Value>, contents: &mut Vec<Value>| {
         if parts.is_empty() {
@@ -303,16 +415,48 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                     }
                 }
             }
+            ResponseItem::FunctionCall { name, call_id, .. } => {
+                function_call_names.insert(call_id.clone(), name.clone());
+            }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                // Present tool outputs as user-visible text so the model
-                // can incorporate them into follow‑up reasoning.
-                if current_role.as_deref() != Some("user") {
+                let function_name = function_call_names
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| call_id.clone());
+
+                if current_role.as_deref() != Some("function") {
                     flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some("user".to_string());
+                    current_role = Some("function".to_string());
+                }
+
+                let mut response_content: Vec<Value> = Vec::new();
+                if let Some(items) = &output.content_items {
+                    for item in items {
+                        match item {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                response_content.push(json!({ "text": text }));
+                            }
+                            FunctionCallOutputContentItem::InputImage { image_url } => {
+                                response_content.push(json!({
+                                    "text": format!("Image: {image_url}"),
+                                }));
+                            }
+                        }
+                    }
+                }
+
+                if response_content.is_empty() {
+                    response_content.push(json!({ "text": output.content }));
                 }
 
                 current_parts.push(json!({
-                    "text": format!("Tool {call_id} result:\n{}", output.content),
+                    "functionResponse": {
+                        "name": function_name,
+                        "response": {
+                            "name": function_name,
+                            "content": response_content,
+                        },
+                    },
                 }));
             }
             ResponseItem::CustomToolCallOutput { call_id, output } => {
@@ -328,7 +472,6 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
             // Skip agent‑internal items that should not be sent to the model.
             ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::FunctionCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::GhostSnapshot { .. }
@@ -381,6 +524,8 @@ fn build_gemini_payload(prompt: &Prompt, model_family: &ModelFamily) -> Result<V
             "parts": [ { "text": full_instructions } ],
         });
     }
+
+    payload["safetySettings"] = Value::Array(safety_settings_allow_tools());
 
     if !tools_json.is_empty() {
         payload["tools"] = Value::Array(tools_json);
@@ -458,9 +603,22 @@ async fn stream_gemini_once(
                     }
                 };
 
+                let token_usage = extract_token_usage(&body_val);
                 let parsed = parse_gemini_response(&body_val);
+                let ParsedGeminiResponse {
+                    text,
+                    function_calls,
+                    reasoning,
+                } = parsed;
+                let mut reasoning_item: Option<ResponseItem> = None;
 
-                if let Some(text) = parsed.text
+                if let Some(reasoning_text) = reasoning
+                    && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning_text).await
+                    {
+                        return;
+                    }
+
+                if let Some(text) = text
                     && !text.is_empty()
                 {
                     let item = ResponseItem::Message {
@@ -484,7 +642,7 @@ async fn stream_gemini_once(
                     }
                 }
 
-                for (idx, fc) in parsed.function_calls.into_iter().enumerate() {
+                for (idx, fc) in function_calls.into_iter().enumerate() {
                     let call_id = format!("gemini_call_{}", idx + 1);
                     let arguments = match serde_json::to_string(&fc.args) {
                         Ok(s) => s,
@@ -510,10 +668,19 @@ async fn stream_gemini_once(
                     }
                 }
 
+                if let Some(item) = reasoning_item.take()
+                    && tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id: String::new(),
-                        token_usage: None,
+                        token_usage: token_usage.clone(),
                     }))
                     .await;
             }
@@ -1166,7 +1333,7 @@ mod live_tests {
                     assert_eq!(args.get("command").and_then(Value::as_str), Some("ls /tmp"));
                     let timeout = round_to_i64(args.get("timeout_ms").unwrap_or(&Value::Null)).unwrap_or(0);
                     assert!(
-                        timeout >= 1_000 && timeout <= 10_000,
+                        (1_000..=10_000).contains(&timeout),
                         "timeout should be reasonable, got {timeout}"
                     );
                 }),
@@ -1272,6 +1439,73 @@ mod live_tests {
     }
 }
 
+async fn append_reasoning_text(
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    reasoning_item: &mut Option<ResponseItem>,
+    text: String,
+) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+
+    if reasoning_item.is_none() {
+        let item = ResponseItem::Reasoning {
+            id: "gemini_reasoning_1".to_string(),
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: String::new(),
+            }],
+            content: Some(Vec::new()),
+            encrypted_content: None,
+        };
+        if tx_event
+            .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        *reasoning_item = Some(item);
+    }
+
+    if let Some(ResponseItem::Reasoning {
+        summary, content, ..
+    }) = reasoning_item
+    {
+        if let Some(ReasoningItemReasoningSummary::SummaryText { text: summary_text }) =
+            summary.first_mut()
+        {
+            summary_text.push_str(&text);
+            if tx_event
+                .send(Ok(ResponseEvent::ReasoningSummaryDelta {
+                    delta: text.clone(),
+                    summary_index: 0,
+                }))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+
+        if let Some(content_items) = content {
+            content_items.push(ReasoningItemContent::ReasoningText { text: text.clone() });
+            let content_index = content_items.len() as i64 - 1;
+            if tx_event
+                .send(Ok(ResponseEvent::ReasoningContentDelta {
+                    delta: text,
+                    content_index,
+                }))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 async fn append_assistant_text(
     tx_event: &mpsc::Sender<Result<ResponseEvent>>,
     assistant_item: &mut Option<ResponseItem>,
@@ -1363,6 +1597,34 @@ mod gemini_tests {
     }
 
     #[test]
+    fn parse_gemini_response_extracts_thought_parts() {
+        let json = json!({
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            { "thought": "Consider inputs. " },
+                            { "text": "Finalize." }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let parsed = parse_gemini_response(&json);
+        assert_eq!(
+            parsed.reasoning.as_deref(),
+            Some("Consider inputs. "),
+            "expected reasoning to include thought text"
+        );
+        assert_eq!(
+            parsed.text.as_deref(),
+            Some("Finalize."),
+            "expected text to include non-thinking content"
+        );
+    }
+
+    #[test]
     fn build_gemini_contents_maps_roles_and_tool_outputs() {
         let mut items = Vec::<ResponseItem>::new();
 
@@ -1385,6 +1647,12 @@ mod gemini_tests {
         });
 
         // Tool output, both as FunctionCallOutput and CustomToolCallOutput.
+        items.push(ResponseItem::FunctionCall {
+            id: None,
+            name: "write_file".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-1".to_string(),
+        });
         items.push(ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
             output: codex_protocol::models::FunctionCallOutputPayload {
@@ -1414,14 +1682,43 @@ mod gemini_tests {
             "expected at least one model role content"
         );
 
-        // Tool outputs should be rendered as user-role text mentioning the call id.
-        let body = serde_json::to_string(&contents).unwrap();
-        assert!(
-            body.contains("Tool call-1 result:\\nresult-1"),
-            "expected function tool output to be present"
+        let function_entry = contents
+            .iter()
+            .find(|c| c["role"] == json!("function"))
+            .expect("expected a function role content entry");
+        let function_response = function_entry["parts"][0]["functionResponse"]
+            .as_object()
+            .expect("functionResponse part should exist");
+        assert_eq!(
+            function_response.get("name"),
+            Some(&json!("write_file")),
+            "functionResponse must carry the tool name"
         );
+        let response_content = function_response
+            .get("response")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(
-            body.contains("Custom tool call-2 result:\\nresult-2"),
+            response_content.contains("result-1"),
+            "expected function output content to be present"
+        );
+
+        let has_custom_output = contents.iter().any(|c| {
+            c["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get("text")
+                        .and_then(Value::as_str)
+                        .map(|t| t.contains("Custom tool call-2 result:\nresult-2"))
+                        .unwrap_or(false)
+                })
+            })
+        });
+        assert!(
+            has_custom_output,
             "expected custom tool output to be present"
         );
     }
@@ -1447,5 +1744,30 @@ mod gemini_tests {
             payload.get("systemInstruction").is_some(),
             "systemInstruction missing"
         );
+        let safety = payload
+            .get("safetySettings")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !safety.is_empty(),
+            "safetySettings should be present to relax harmful content filters"
+        );
+    }
+
+    #[test]
+    fn extract_token_usage_reads_usage_metadata() {
+        let json = json!({
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 14
+            }
+        });
+
+        let usage = extract_token_usage(&json).expect("usage metadata");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
     }
 }
