@@ -150,16 +150,15 @@ async fn process_gemini_sse<S>(
         } = parsed;
 
         if let Some(reasoning) = reasoning
-            && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning).await {
-                return;
-            }
+            && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning).await
+        {
+            return;
+        }
 
-        if let Some(text) = text {
-            if append_assistant_text(&tx_event, &mut assistant_item, text).await {
-                continue;
-            } else {
-                return;
-            }
+        if let Some(text) = text
+            && !append_assistant_text(&tx_event, &mut assistant_item, text).await
+        {
+            return;
         }
 
         if !function_calls.is_empty() {
@@ -168,18 +167,18 @@ async fn process_gemini_sse<S>(
                     .send(Ok(ResponseEvent::OutputItemDone(item)))
                     .await
                     .is_err()
-                {
-                    return;
-                }
+            {
+                return;
+            }
 
             if let Some(item) = reasoning_item.take()
                 && tx_event
                     .send(Ok(ResponseEvent::OutputItemDone(item)))
                     .await
                     .is_err()
-                {
-                    return;
-                }
+            {
+                return;
+            }
 
             for (idx, fc) in function_calls.into_iter().enumerate() {
                 let call_id = format!("gemini_call_{}", idx + 1);
@@ -278,7 +277,7 @@ fn safety_settings_allow_tools() -> Vec<Value> {
             "threshold": "BLOCK_NONE",
         }),
         json!({
-            "category": "HARM_CATEGORY_VIOLENCE",
+            "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
             "threshold": "BLOCK_NONE",
         }),
     ]
@@ -318,10 +317,11 @@ fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
             }
 
             if let Some(thought_val) = part.get("thought")
-                && let Some(thought_text) = extract_text_value(thought_val) {
-                    let entry = reasoning.get_or_insert_with(String::new);
-                    entry.push_str(&thought_text);
-                }
+                && let Some(thought_text) = extract_text_value(thought_val)
+            {
+                let entry = reasoning.get_or_insert_with(String::new);
+                entry.push_str(&thought_text);
+            }
 
             if let Some(fc_val) = part
                 .get("functionCall")
@@ -614,9 +614,9 @@ async fn stream_gemini_once(
 
                 if let Some(reasoning_text) = reasoning
                     && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning_text).await
-                    {
-                        return;
-                    }
+                {
+                    return;
+                }
 
                 if let Some(text) = text
                     && !text.is_empty()
@@ -673,9 +673,9 @@ async fn stream_gemini_once(
                         .send(Ok(ResponseEvent::OutputItemDone(item)))
                         .await
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
+                }
 
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {

@@ -443,6 +443,91 @@ data: [DONE]\n\
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_streaming_handles_text_and_function_call_in_same_chunk() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    let sse_body = "\
+data: {\"result\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Plan and call tool\"},{\"functionCall\":{\"name\":\"append_file\",\"args\":{\"path\":\"/tmp/log.txt\",\"content\":\"details\"}}}]}}]}}\n\
+\n\
+data: [DONE]\n\
+\n";
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut query_params = HashMap::new();
+    query_params.insert("alt".to_string(), "sse".to_string());
+    let (client, _config) = build_gemini_client(
+        &server,
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        Some(query_params),
+    )
+    .await;
+
+    let prompt = simple_user_prompt("prepare file");
+    let mut stream = client.stream(&prompt).await.expect("stream");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event should be Ok"));
+    }
+
+    let assistant_text = extract_assistant_text(&events);
+    assert!(
+        assistant_text.contains("Plan and call tool"),
+        "assistant text should be present when text and functionCall share a chunk"
+    );
+
+    let mut order = Vec::new();
+    let mut function_call = None;
+    for ev in events {
+        match ev {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { .. }) => {
+                order.push("assistant_done")
+            }
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                order.push("function_call");
+                function_call = Some((name, arguments, call_id));
+            }
+            ResponseEvent::Completed { .. } => order.push("completed"),
+            ResponseEvent::OutputItemAdded(_) | ResponseEvent::OutputTextDelta(_) => {}
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        order,
+        vec!["assistant_done", "function_call", "completed"],
+        "function call should not be dropped when chunk also contains text"
+    );
+
+    let (name, arguments, call_id) =
+        function_call.expect("expected function call even when text precedes it");
+    assert_eq!(name, "append_file");
+    assert_eq!(call_id, "gemini_call_1");
+
+    let args: Value = serde_json::from_str(&arguments).expect("arguments should parse");
+    assert_eq!(args["path"], json!("/tmp/log.txt"));
+    assert_eq!(args["content"], json!("details"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gemini_non_streaming_emits_multiple_function_calls_with_rich_arguments() {
     skip_if_no_network!();
 
