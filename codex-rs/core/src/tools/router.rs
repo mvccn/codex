@@ -183,6 +183,7 @@ impl ToolRouter {
                     success: Some(false),
                     ..Default::default()
                 },
+                thought_signature: None,
             }
         }
     }

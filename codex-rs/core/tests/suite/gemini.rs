@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use codex_app_server_protocol::AuthMode;
 use codex_core::ContentItem;
 use codex_core::ModelClient;
@@ -93,6 +95,7 @@ fn simple_user_prompt(text: &str) -> Prompt {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }];
     prompt
 }
@@ -211,6 +214,99 @@ async fn gemini_non_streaming_round_trip_and_payload_shape() {
             .contains("strict"),
         "Gemini payload must not contain strict anywhere",
     );
+
+    let generation_config = payload
+        .get("generationConfig")
+        .and_then(Value::as_object)
+        .expect("generationConfig");
+    let thinking_config = generation_config
+        .get("thinkingConfig")
+        .and_then(Value::as_object)
+        .expect("thinkingConfig");
+    assert_eq!(
+        thinking_config.get("thinkingLevel"),
+        Some(&json!("HIGH")),
+        "Gemini requests should propagate reasoning effort into thinking_level"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_non_streaming_includes_output_schema_and_thinking_level() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    let body = json!({
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        { "text": "structured" }
+                    ],
+                    "role": "model"
+                }
+            }
+        ]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(body.clone()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (client, _config) = build_gemini_client(
+        &server,
+        "/v1beta/models/gemini-2.0-flash:generateContent",
+        None,
+    )
+    .await;
+
+    let mut prompt = simple_user_prompt("hi");
+    prompt.output_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "foo": { "type": "string" }
+        },
+        "required": ["foo"]
+    }));
+
+    let mut stream = client.stream(&prompt).await.expect("stream");
+    while let Some(ev) = stream.next().await {
+        ev.expect("event should be Ok");
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("expected at least one request");
+    let payload: Value = requests[0]
+        .body_json()
+        .expect("Gemini request body should be JSON");
+
+    let generation_config = payload
+        .get("generationConfig")
+        .and_then(Value::as_object)
+        .expect("generationConfig");
+    let thinking_config = generation_config
+        .get("thinkingConfig")
+        .and_then(Value::as_object)
+        .expect("thinkingConfig");
+    assert_eq!(thinking_config.get("thinkingLevel"), Some(&json!("HIGH")));
+    assert_eq!(
+        generation_config.get("responseMimeType"),
+        Some(&json!("application/json"))
+    );
+    let schema = generation_config
+        .get("responseJsonSchema")
+        .and_then(Value::as_object)
+        .expect("responseJsonSchema");
+    assert_eq!(schema.get("type"), Some(&json!("object")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -765,12 +861,14 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
         content: vec![ContentItem::InputText {
             text: "run tools".to_string(),
         }],
+        thought_signature: None,
     });
     prompt.input.push(ResponseItem::FunctionCall {
         id: None,
         name: "write_file".to_string(),
         arguments: json!({ "path": "/tmp/demo.txt", "contents": "hello" }).to_string(),
         call_id: "call-1".to_string(),
+        thought_signature: Some("Y29kZXhfdGhvdWdodF9zaWdfY2FsbC0x".to_string()),
     });
     prompt.input.push(ResponseItem::FunctionCallOutput {
         call_id: "call-1".to_string(),
@@ -778,6 +876,7 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
             content: "file saved".to_string(),
             ..Default::default()
         },
+        thought_signature: Some("Y29kZXhfdGhvdWdodF9zaWdfY2FsbC0x".to_string()),
     });
     prompt.input.push(ResponseItem::CustomToolCallOutput {
         call_id: "call-2".to_string(),
@@ -821,10 +920,17 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
         Some(&json!("write_file")),
         "functionCall should include the function name"
     );
-    assert_eq!(
-        function_call_entry["parts"][0].get("thought_signature"),
-        Some(&json!("codex_thought_sig_call-1")),
-        "functionCall part should carry a thought signature"
+    let function_call_sig = function_call_entry["parts"][0]
+        .get("thoughtSignature")
+        .and_then(Value::as_str)
+        .expect("thought signature value");
+    let decoded_sig = STANDARD_NO_PAD
+        .decode(function_call_sig.as_bytes())
+        .expect("base64 thought signature");
+    let decoded_sig = String::from_utf8(decoded_sig).expect("utf8 thought signature");
+    assert!(
+        decoded_sig.starts_with("codex_thought_sig_call-1"),
+        "expected prefixed thought signature, got {decoded_sig:?}"
     );
     let call_args = function_call
         .get("args")
@@ -860,10 +966,18 @@ async fn gemini_payload_includes_tool_outputs_in_followup_turn() {
         Some(&json!("write_file")),
         "functionResponse should include the function name"
     );
-    assert_eq!(
-        function_entry["parts"][0].get("thought_signature"),
-        Some(&json!("codex_thought_sig_call-1")),
-        "functionResponse part should echo the thought signature"
+    let function_response_sig = function_entry["parts"][0]
+        .get("thoughtSignature")
+        .and_then(Value::as_str)
+        .expect("thought signature value");
+    let decoded_response_sig = STANDARD_NO_PAD
+        .decode(function_response_sig.as_bytes())
+        .expect("base64 thought signature");
+    let decoded_response_sig =
+        String::from_utf8(decoded_response_sig).expect("utf8 thought signature");
+    assert!(
+        decoded_response_sig.starts_with("codex_thought_sig_call-1"),
+        "expected prefixed thought signature, got {decoded_response_sig:?}"
     );
     let function_content_text = function_response
         .get("response")

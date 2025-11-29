@@ -24,10 +24,15 @@ pub(crate) async fn process_items(
         }
 
         match response {
-            Some(ResponseInputItem::FunctionCallOutput { call_id, output }) => {
+            Some(ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                thought_signature,
+            }) => {
                 new_inputs_to_record.push(ResponseItem::FunctionCallOutput {
                     call_id: call_id.clone(),
                     output: output.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
             }
 
@@ -49,6 +54,7 @@ pub(crate) async fn process_items(
                 new_inputs_to_record.push(ResponseItem::FunctionCallOutput {
                     call_id: call_id.clone(),
                     output,
+                    thought_signature: None,
                 });
             }
             None => {}

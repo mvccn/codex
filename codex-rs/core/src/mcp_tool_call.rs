@@ -37,6 +37,7 @@ pub(crate) async fn handle_mcp_tool_call(
                         success: Some(false),
                         ..Default::default()
                     },
+                    thought_signature: None,
                 };
             }
         }

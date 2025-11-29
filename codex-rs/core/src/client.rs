@@ -141,6 +141,8 @@ impl ModelClient {
                 stream_gemini(
                     prompt,
                     &self.config.model_family,
+                    self.effort
+                        .or(self.config.model_family.default_reasoning_effort),
                     &client,
                     &self.provider,
                     &self.otel_event_manager,

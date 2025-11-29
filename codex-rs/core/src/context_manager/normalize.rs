@@ -33,6 +33,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                                 content: "aborted".to_string(),
                                 ..Default::default()
                             },
+                            thought_signature: None,
                         },
                     ));
                 }
@@ -80,6 +81,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                                     content: "aborted".to_string(),
                                     ..Default::default()
                                 },
+                                thought_signature: None,
                             },
                         ));
                     }

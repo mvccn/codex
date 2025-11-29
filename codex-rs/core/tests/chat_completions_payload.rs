@@ -123,6 +123,7 @@ fn user_message(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn assistant_message(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -153,6 +155,7 @@ fn function_call() -> ResponseItem {
         name: "f".to_string(),
         arguments: "{}".to_string(),
         call_id: "c1".to_string(),
+        thought_signature: None,
     }
 }
 

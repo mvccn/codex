@@ -22,6 +22,7 @@ fn assistant_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn user_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -82,6 +84,7 @@ fn filters_non_api_messages() {
         content: vec![ContentItem::OutputText {
             text: "ignored".to_string(),
         }],
+        thought_signature: None,
     };
     let reasoning = reasoning_msg("thinking...");
     h.record_items([&system, &reasoning, &ResponseItem::Other], policy);
@@ -109,15 +112,17 @@ fn filters_non_api_messages() {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: "hi".to_string()
-                }]
+                    text: "hi".to_string(),
+                }],
+                thought_signature: None,
             },
             ResponseItem::Message {
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: "hello".to_string()
-                }]
+                    text: "hello".to_string(),
+                }],
+                thought_signature: None,
             }
         ]
     );
@@ -163,6 +168,7 @@ fn remove_first_item_removes_matching_output_for_function_call() {
             name: "do_it".to_string(),
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
+            thought_signature: None,
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -170,6 +176,7 @@ fn remove_first_item_removes_matching_output_for_function_call() {
                 content: "ok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
     ];
     let mut h = create_history_with_items(items);
@@ -186,12 +193,14 @@ fn remove_first_item_removes_matching_call_for_output() {
                 content: "ok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
         ResponseItem::FunctionCall {
             id: None,
             name: "do_it".to_string(),
             arguments: "{}".to_string(),
             call_id: "call-2".to_string(),
+            thought_signature: None,
         },
     ];
     let mut h = create_history_with_items(items);
@@ -220,6 +229,7 @@ fn remove_first_item_handles_local_shell_pair() {
                 content: "ok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
     ];
     let mut h = create_history_with_items(items);
@@ -268,6 +278,7 @@ fn normalization_retains_local_shell_outputs() {
                 content: "Total output lines: 1\n\nok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
     ];
 
@@ -291,6 +302,7 @@ fn record_items_truncates_function_call_output_content() {
             success: Some(true),
             ..Default::default()
         },
+        thought_signature: None,
     };
 
     history.record_items([&item], policy);
@@ -356,6 +368,7 @@ fn record_items_respects_custom_token_limit() {
             success: Some(true),
             ..Default::default()
         },
+        thought_signature: None,
     };
 
     history.record_items([&item], policy);
@@ -484,6 +497,7 @@ fn normalize_adds_missing_output_for_function_call() {
                 name: "do_it".to_string(),
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
+                thought_signature: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-x".to_string(),
@@ -491,6 +505,7 @@ fn normalize_adds_missing_output_for_function_call() {
                     content: "aborted".to_string(),
                     ..Default::default()
                 },
+                thought_signature: None,
             },
         ]
     );
@@ -568,6 +583,7 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
                     content: "aborted".to_string(),
                     ..Default::default()
                 },
+                thought_signature: None,
             },
         ]
     );
@@ -582,6 +598,7 @@ fn normalize_removes_orphan_function_call_output() {
             content: "ok".to_string(),
             ..Default::default()
         },
+        thought_signature: None,
     }];
     let mut h = create_history_with_items(items);
 
@@ -614,6 +631,7 @@ fn normalize_mixed_inserts_and_removals() {
             name: "f1".to_string(),
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
+            thought_signature: None,
         },
         // Orphan output that should be removed
         ResponseItem::FunctionCallOutput {
@@ -622,6 +640,7 @@ fn normalize_mixed_inserts_and_removals() {
                 content: "ok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
         // Will get an inserted custom tool output
         ResponseItem::CustomToolCall {
@@ -657,6 +676,7 @@ fn normalize_mixed_inserts_and_removals() {
                 name: "f1".to_string(),
                 arguments: "{}".to_string(),
                 call_id: "c1".to_string(),
+                thought_signature: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
@@ -664,6 +684,7 @@ fn normalize_mixed_inserts_and_removals() {
                     content: "aborted".to_string(),
                     ..Default::default()
                 },
+                thought_signature: None,
             },
             ResponseItem::CustomToolCall {
                 id: None,
@@ -694,6 +715,7 @@ fn normalize_mixed_inserts_and_removals() {
                     content: "aborted".to_string(),
                     ..Default::default()
                 },
+                thought_signature: None,
             },
         ]
     );
@@ -709,6 +731,7 @@ fn normalize_adds_missing_output_for_function_call_panics_in_debug() {
         name: "do_it".to_string(),
         arguments: "{}".to_string(),
         call_id: "call-x".to_string(),
+        thought_signature: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history();
@@ -759,6 +782,7 @@ fn normalize_removes_orphan_function_call_output_panics_in_debug() {
             content: "ok".to_string(),
             ..Default::default()
         },
+        thought_signature: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history();
@@ -786,6 +810,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             name: "f1".to_string(),
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
+            thought_signature: None,
         },
         ResponseItem::FunctionCallOutput {
             call_id: "c2".to_string(),
@@ -793,6 +818,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
                 content: "ok".to_string(),
                 ..Default::default()
             },
+            thought_signature: None,
         },
         ResponseItem::CustomToolCall {
             id: None,

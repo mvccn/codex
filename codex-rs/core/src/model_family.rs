@@ -242,6 +242,7 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
         model_family!(
             slug, "gemini",
             base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
         )
     } else {
         None

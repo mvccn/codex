@@ -108,6 +108,7 @@ impl ToolOutput {
                             content_items,
                             success,
                         },
+                        thought_signature: None,
                     }
                 }
             }
@@ -198,7 +199,9 @@ mod tests {
         .into_response("fn-1", &payload);
 
         match response {
-            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+            ResponseInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 assert_eq!(call_id, "fn-1");
                 assert_eq!(output.content, "ok");
                 assert!(output.content_items.is_none());

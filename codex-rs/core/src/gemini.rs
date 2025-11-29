@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::AuthManager;
-use crate::ModelProviderInfo;
+use crate::auth::AuthManager;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_common::tools::ToolSpec;
 use crate::default_client::CodexHttpClient;
 use crate::error::CodexErr;
 use crate::error::ConnectionFailedError;
@@ -14,1793 +13,901 @@ use crate::error::ResponseStreamFailed;
 use crate::error::Result;
 use crate::error::UnexpectedResponseError;
 use crate::model_family::ModelFamily;
+use crate::model_provider_info::ModelProviderInfo;
 use crate::tools::spec::create_tools_json_for_gemini_api;
-use bytes::Bytes;
 use codex_otel::otel_event_manager::OtelEventManager;
+use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ReasoningItemContent;
-use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
-use futures::Stream;
 use futures::StreamExt;
-use futures::TryStreamExt;
+use reqwest::Response;
+use reqwest::header::ACCEPT;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderName;
+use serde::Deserialize;
 use serde_json::Value;
-use serde_json::json;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tracing::debug;
+use uuid::Uuid;
 
-/// Native Gemini adapter dispatcher. Uses streaming (`streamGenerateContent`)
-/// when the provider is configured for it (typically via a base URL that
-/// contains `:streamGenerateContent` or a query parameter `alt=sse`), and
-/// falls back to a single `generateContent` request otherwise.
-pub(crate) async fn stream_gemini(
-    prompt: &Prompt,
-    model_family: &ModelFamily,
-    client: &CodexHttpClient,
-    provider: &ModelProviderInfo,
-    otel_event_manager: &OtelEventManager,
-    _session_source: &SessionSource,
-    auth_manager: &Option<Arc<AuthManager>>,
-) -> Result<ResponseStream> {
-    let payload = build_gemini_payload(prompt, model_family)?;
+use crate::gemini_models::Blob;
+use crate::gemini_models::Content;
+use crate::gemini_models::ErrorEnvelope;
+use crate::gemini_models::FunctionCall;
+use crate::gemini_models::FunctionResponse;
+use crate::gemini_models::GenerateContentRequest;
+use crate::gemini_models::GenerationConfig;
+use crate::gemini_models::Part;
+use crate::gemini_models::ThinkingConfig;
+use crate::gemini_models::Tool;
+use crate::gemini_models::UsageMetadata;
 
-    if provider_requests_streaming(provider) {
-        stream_gemini_streaming(payload, client, provider, otel_event_manager, auth_manager).await
-    } else {
-        stream_gemini_once(payload, client, provider, otel_event_manager, auth_manager).await
-    }
-}
-
-/// Process Gemini SSE events by forwarding assistant deltas + tool calls
-/// as Codex `ResponseEvent`s.
-async fn process_gemini_sse<S>(
-    stream: S,
-    tx_event: mpsc::Sender<Result<ResponseEvent>>,
-    idle_timeout: Duration,
-    otel_event_manager: OtelEventManager,
-) where
-    S: Stream<Item = Result<Bytes>> + Unpin + Eventsource,
-{
-    let mut stream = stream.eventsource();
-    let mut assistant_item: Option<ResponseItem> = None;
-    let mut reasoning_item: Option<ResponseItem> = None;
-    let mut token_usage: Option<TokenUsage> = None;
-
-    loop {
-        let response = timeout(idle_timeout, stream.next()).await;
-        otel_event_manager.log_sse_event(&response, idle_timeout);
-
-        let sse = match response {
-            Ok(Some(Ok(ev))) => ev,
-            Ok(Some(Err(e))) => {
-                let _ = tx_event
-                    .send(Err(CodexErr::Stream(e.to_string(), None)))
-                    .await;
-                return;
-            }
-            Ok(None) => {
-                if let Some(item) = assistant_item.take() {
-                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                }
-                if let Some(item) = reasoning_item.take() {
-                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                }
-                let _ = tx_event
-                    .send(Ok(ResponseEvent::Completed {
-                        response_id: String::new(),
-                        token_usage: token_usage.clone(),
-                    }))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                let _ = tx_event
-                    .send(Err(CodexErr::Stream(
-                        "idle timeout waiting for SSE".into(),
-                        None,
-                    )))
-                    .await;
-                return;
-            }
-        };
-
-        let data = sse.data.trim();
-        if data.is_empty() {
-            continue;
-        }
-
-        if data.eq_ignore_ascii_case("[DONE]") {
-            if let Some(item) = assistant_item.take() {
-                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-            }
-            if let Some(item) = reasoning_item.take() {
-                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-            }
-            let _ = tx_event
-                .send(Ok(ResponseEvent::Completed {
-                    response_id: String::new(),
-                    token_usage: token_usage.clone(),
-                }))
-                .await;
-            return;
-        }
-
-        let chunk: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("Failed to parse Gemini SSE chunk: {e}");
-                continue;
-            }
-        };
-
-        let payload = chunk.get("result").cloned().unwrap_or(chunk);
-        if let Some(usage) = extract_token_usage(&payload) {
-            token_usage = Some(usage);
-        }
-        let parsed = parse_gemini_response(&payload);
-        let ParsedGeminiResponse {
-            text,
-            function_calls,
-            reasoning,
-        } = parsed;
-
-        if let Some(reasoning) = reasoning
-            && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning).await
-        {
-            return;
-        }
-
-        if let Some(text) = text
-            && !append_assistant_text(&tx_event, &mut assistant_item, text).await
-        {
-            return;
-        }
-
-        if !function_calls.is_empty() {
-            if let Some(item) = assistant_item.take()
-                && tx_event
-                    .send(Ok(ResponseEvent::OutputItemDone(item)))
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-
-            if let Some(item) = reasoning_item.take()
-                && tx_event
-                    .send(Ok(ResponseEvent::OutputItemDone(item)))
-                    .await
-                    .is_err()
-            {
-                return;
-            }
-
-            for (idx, fc) in function_calls.into_iter().enumerate() {
-                let call_id = format!("gemini_call_{}", idx + 1);
-                let arguments = match serde_json::to_string(&fc.args) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx_event.send(Err(CodexErr::Json(e))).await;
-                        return;
-                    }
-                };
-
-                let item = ResponseItem::FunctionCall {
-                    id: None,
-                    name: fc.name,
-                    arguments,
-                    call_id,
-                };
-
-                if tx_event
-                    .send(Ok(ResponseEvent::OutputItemDone(item)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
-            let _ = tx_event
-                .send(Ok(ResponseEvent::Completed {
-                    response_id: String::new(),
-                    token_usage: token_usage.clone(),
-                }))
-                .await;
-            return;
-        }
-    }
-}
-
-/// Minimal representation of a Gemini function call used for translation
-/// into Codex `ResponseItem::FunctionCall`.
-struct GeminiFunctionCall {
-    name: String,
-    args: Value,
-}
-
-/// Parsed Gemini response fields that Codex cares about: assistant text
-/// and function calls. We currently focus on the first candidate.
-struct ParsedGeminiResponse {
-    text: Option<String>,
-    function_calls: Vec<GeminiFunctionCall>,
-    reasoning: Option<String>,
-}
-
-fn extract_token_usage(root: &Value) -> Option<TokenUsage> {
-    let usage = root
-        .get("usageMetadata")
-        .or_else(|| root.get("result").and_then(|v| v.get("usageMetadata")))?;
-
-    let input_tokens = usage
-        .get("promptTokenCount")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("candidatesTokenCount")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("totalTokenCount")
-        .and_then(Value::as_i64)
-        .unwrap_or(input_tokens + output_tokens);
-
-    Some(TokenUsage {
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        ..Default::default()
-    })
-}
-
-fn safety_settings_allow_tools() -> Vec<Value> {
-    vec![
-        json!({
-            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_NONE",
-        }),
-        json!({
-            "category": "HARM_CATEGORY_HARASSMENT",
-            "threshold": "BLOCK_NONE",
-        }),
-        json!({
-            "category": "HARM_CATEGORY_HATE_SPEECH",
-            "threshold": "BLOCK_NONE",
-        }),
-        json!({
-            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-            "threshold": "BLOCK_NONE",
-        }),
-        json!({
-            "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
-            "threshold": "BLOCK_NONE",
-        }),
-    ]
-}
-
-fn extract_text_value(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_string());
-    }
-
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-
-    if value.is_null() {
-        return None;
-    }
-
-    serde_json::to_string(value).ok()
-}
-
-fn parse_gemini_response(root: &Value) -> ParsedGeminiResponse {
-    let mut text: Option<String> = None;
-    let mut function_calls: Vec<GeminiFunctionCall> = Vec::new();
-    let mut reasoning: Option<String> = None;
-
-    // Preferred path: candidates[0].content.parts[*]
-    if let Some(candidates) = root.get("candidates").and_then(|v| v.as_array())
-        && let Some(first) = candidates.first()
-        && let Some(content) = first.get("content")
-        && let Some(parts) = content.get("parts").and_then(|v| v.as_array())
-    {
-        let mut buf = String::new();
-        for part in parts {
-            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                buf.push_str(t);
-            }
-
-            if let Some(thought_val) = part.get("thought")
-                && let Some(thought_text) = extract_text_value(thought_val)
-            {
-                let entry = reasoning.get_or_insert_with(String::new);
-                entry.push_str(&thought_text);
-            }
-
-            if let Some(fc_val) = part
-                .get("functionCall")
-                .or_else(|| part.get("function_call"))
-                && let Some(name) = fc_val.get("name").and_then(|v| v.as_str())
-            {
-                let args = fc_val.get("args").cloned().unwrap_or(Value::Null);
-                function_calls.push(GeminiFunctionCall {
-                    name: name.to_string(),
-                    args,
-                });
-            }
-        }
-
-        if !buf.is_empty() {
-            text = Some(buf);
-        }
-    }
-
-    // Fallback path: top‑level OpenAPI‑compatible functionCalls array.
-    if let Some(fcs) = root.get("functionCalls").and_then(|v| v.as_array()) {
-        for fc in fcs {
-            if let Some(name) = fc.get("name").and_then(|v| v.as_str()) {
-                let args = fc.get("args").cloned().unwrap_or(Value::Null);
-                function_calls.push(GeminiFunctionCall {
-                    name: name.to_string(),
-                    args,
-                });
-            }
-        }
-    }
-
-    ParsedGeminiResponse {
-        text,
-        function_calls,
-        reasoning,
-    }
-}
-
-/// Translate Codex `ResponseItem` history into Gemini `contents`. This is a
-/// best‑effort mapping that:
-///   * preserves the user/assistant roles where possible
-///   * encodes text as `parts[{text: ...}]`
-///   * returns tool outputs as Gemini `functionResponse` parts
-fn build_gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
-    let mut contents: Vec<Value> = Vec::new();
-    let mut current_role: Option<String> = None;
-    let mut current_parts: Vec<Value> = Vec::new();
-    let mut function_call_names: HashMap<String, String> = HashMap::new();
-    let mut function_call_signatures: HashMap<String, String> = HashMap::new();
-
-    let flush = |role: &mut Option<String>, parts: &mut Vec<Value>, contents: &mut Vec<Value>| {
-        if parts.is_empty() {
-            return;
-        }
-
-        let role_val = role.as_deref().unwrap_or("user").to_string();
-        contents.push(json!({
-            "role": role_val,
-            "parts": parts.clone(),
-        }));
-        parts.clear();
-    };
-
-    for item in items {
-        match item {
-            ResponseItem::Message { role, content, .. } => {
-                // Map Codex roles to Gemini roles.
-                let gemini_role = if role == "assistant" {
-                    "model".to_string()
-                } else {
-                    "user".to_string()
-                };
-
-                if current_role.as_deref() != Some(gemini_role.as_str()) {
-                    flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some(gemini_role);
-                }
-
-                for c in content {
-                    match c {
-                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                            current_parts.push(json!({ "text": text }));
-                        }
-                        ContentItem::InputImage { image_url } => {
-                            // Minimal image support: describe the image path/URL
-                            // as text so Gemini can still reason about it.
-                            current_parts.push(json!({
-                                "text": format!("Image: {image_url}"),
-                            }));
-                        }
-                    }
-                }
-            }
-            ResponseItem::FunctionCall {
-                name,
-                call_id,
-                arguments,
-                ..
-            } => {
-                function_call_names.insert(call_id.clone(), name.clone());
-                let thought_signature = format!("codex_thought_sig_{call_id}");
-                function_call_signatures.insert(call_id.clone(), thought_signature.clone());
-
-                if current_role.as_deref() != Some("model") {
-                    flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some("model".to_string());
-                }
-
-                let args_json = serde_json::from_str(arguments).unwrap_or_else(|e| {
-                    debug!("Failed to parse function call args for {name}: {e}");
-                    Value::Null
-                });
-
-                current_parts.push(json!({
-                    "functionCall": {
-                        "name": name,
-                        "args": args_json,
-                    },
-                    "thought_signature": thought_signature,
-                }));
-            }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
-                let function_name = function_call_names
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| call_id.clone());
-                let thought_signature = function_call_signatures.get(call_id).cloned();
-
-                if current_role.as_deref() != Some("user") {
-                    flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some("user".to_string());
-                }
-
-                let mut response_content: Vec<Value> = Vec::new();
-                if let Some(items) = &output.content_items {
-                    for item in items {
-                        match item {
-                            FunctionCallOutputContentItem::InputText { text } => {
-                                response_content.push(json!({ "text": text }));
-                            }
-                            FunctionCallOutputContentItem::InputImage { image_url } => {
-                                response_content.push(json!({
-                                    "text": format!("Image: {image_url}"),
-                                }));
-                            }
-                        }
-                    }
-                }
-
-                if response_content.is_empty() {
-                    response_content.push(json!({ "text": output.content }));
-                }
-
-                let mut function_response = json!({
-                    "functionResponse": {
-                        "name": function_name,
-                        "response": {
-                            "name": function_name,
-                            "content": response_content,
-                        },
-                    },
-                });
-
-                if let Some(signature) = thought_signature {
-                    function_response["thought_signature"] = json!(signature);
-                }
-
-                current_parts.push(function_response);
-            }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
-                if current_role.as_deref() != Some("user") {
-                    flush(&mut current_role, &mut current_parts, &mut contents);
-                    current_role = Some("user".to_string());
-                }
-
-                current_parts.push(json!({
-                    "text": format!("Custom tool {call_id} result:\n{output}"),
-                }));
-            }
-            // Skip agent‑internal items that should not be sent to the model.
-            ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::GhostSnapshot { .. }
-            | ResponseItem::CompactionSummary { .. }
-            | ResponseItem::Other => {}
-        }
-    }
-
-    flush(&mut current_role, &mut current_parts, &mut contents);
-    contents
-}
-// Adapter-focused Gemini tests live in `core/tests/gemini_*.rs` to keep the
-// production code path focused. Live smoke tests that hit the real Gemini API
-// sit under `live_tests` below.
-
-fn provider_requests_streaming(provider: &ModelProviderInfo) -> bool {
+fn provider_requests_sse(provider: &ModelProviderInfo) -> bool {
     provider
         .base_url
-        .as_deref()
-        .map(|u| u.contains(":streamGenerateContent"))
-        .unwrap_or(false)
+        .as_ref()
+        .is_some_and(|url| url.contains("streamGenerateContent"))
         || provider.query_params.as_ref().is_some_and(|params| {
             params
                 .get("alt")
-                .map(|v| v.eq_ignore_ascii_case("sse"))
+                .map(|value| value.eq_ignore_ascii_case("sse"))
                 .unwrap_or(false)
         })
 }
 
-fn build_gemini_payload(prompt: &Prompt, model_family: &ModelFamily) -> Result<Value> {
-    if prompt.output_schema.is_some() {
-        return Err(CodexErr::UnsupportedOperation(
-            "output_schema is not supported for Gemini wire_api".to_string(),
-        ));
-    }
-
-    let full_instructions = prompt.get_full_instructions(model_family);
-    let input_with_instructions = prompt.get_formatted_input();
-
-    let contents_json = build_gemini_contents(&input_with_instructions);
-    let tools_json = create_tools_json_for_gemini_api(&prompt.tools)?;
-
-    let mut payload = json!({
-        "contents": contents_json,
-    });
-
-    if !full_instructions.is_empty() {
-        payload["systemInstruction"] = json!({
-            "role": "system",
-            "parts": [ { "text": full_instructions } ],
-        });
-    }
-
-    payload["safetySettings"] = Value::Array(safety_settings_allow_tools());
-
-    if !tools_json.is_empty() {
-        payload["tools"] = Value::Array(tools_json);
-        payload["toolConfig"] = json!({
-            "functionCallingConfig": {
-                "mode": "AUTO",
-            }
-        });
-    }
-
-    Ok(payload)
-}
-
-async fn stream_gemini_once(
-    payload: Value,
+pub async fn stream_gemini(
+    prompt: &Prompt,
+    model_family: &ModelFamily,
+    reasoning_effort: Option<ReasoningEffortConfig>,
     client: &CodexHttpClient,
     provider: &ModelProviderInfo,
     otel_event_manager: &OtelEventManager,
-    _auth_manager: &Option<Arc<AuthManager>>,
+    session_source: &SessionSource,
+    auth_manager: &Option<Arc<AuthManager>>,
 ) -> Result<ResponseStream> {
-    // Gemini authentication is driven entirely by API keys passed via
-    // `env_http_headers` / `http_headers`. Avoid forwarding any existing
-    // ChatGPT auth token as an `Authorization: Bearer` header, since the
-    // Gemini endpoint does not accept it and will respond with 401 when an
-    // unexpected credential is present.
-    let auth: Option<crate::auth::CodexAuth> = None;
-    let target_url = provider.get_full_url(&auth);
-    debug!(
-        "Gemini request (non-streaming) -> {} payload={}",
-        target_url, payload
-    );
+    let _ = session_source;
 
-    let mut req_builder = provider.create_request_builder(client, &auth).await?;
+    let auth = auth_manager.as_ref().and_then(|manager| manager.auth());
+    let request = build_gemini_request(prompt, model_family, reasoning_effort)?;
 
-    req_builder = req_builder
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&payload);
+    let mut request_builder = provider.create_request_builder(client, &auth).await?;
+    if provider_requests_sse(provider) {
+        request_builder = request_builder.header(ACCEPT, "text/event-stream");
+    }
+    let response = request_builder
+        .json(&request)
+        .send()
+        .await
+        .map_err(|err| CodexErr::ConnectionFailed(ConnectionFailedError { source: err }))?;
 
-    let res = otel_event_manager
-        .log_request(0, || req_builder.send())
-        .await;
+    let request_id = extract_request_id(response.headers());
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "failed to read response body".to_string());
+        return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status,
+            body,
+            request_id,
+        }));
+    }
 
-    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(16);
+    let mut is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"));
+    if !is_sse && provider_requests_sse(provider) {
+        is_sse = true;
+    }
+
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+    let manager = otel_event_manager.clone();
 
     tokio::spawn(async move {
-        match res {
-            Ok(resp) => {
-                let status = resp.status();
+        if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+            return;
+        }
 
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    let err = CodexErr::UnexpectedStatus(UnexpectedResponseError {
-                        status,
-                        body,
-                        request_id: None,
-                    });
-                    let _ = tx_event.send(Err(err)).await;
-                    return;
-                }
+        let outcome = if is_sse {
+            process_sse_response(response, tx_event.clone(), manager.clone()).await
+        } else {
+            process_json_response(response, tx_event.clone(), manager.clone()).await
+        };
 
-                let body_bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let err = CodexErr::ConnectionFailed(ConnectionFailedError { source: e });
-                        let _ = tx_event.send(Err(err)).await;
-                        return;
-                    }
-                };
-
-                let body_val: Value = match serde_json::from_slice(&body_bytes) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx_event.send(Err(CodexErr::Json(e))).await;
-                        return;
-                    }
-                };
-
-                let token_usage = extract_token_usage(&body_val);
-                let parsed = parse_gemini_response(&body_val);
-                let ParsedGeminiResponse {
-                    text,
-                    function_calls,
-                    reasoning,
-                } = parsed;
-                let mut reasoning_item: Option<ResponseItem> = None;
-
-                if let Some(reasoning_text) = reasoning
-                    && !append_reasoning_text(&tx_event, &mut reasoning_item, reasoning_text).await
-                {
-                    return;
-                }
-
-                if let Some(text) = text
-                    && !text.is_empty()
-                {
-                    let item = ResponseItem::Message {
-                        id: None,
-                        role: "assistant".to_string(),
-                        content: vec![ContentItem::OutputText { text }],
-                    };
-                    if tx_event
-                        .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-
-                for (idx, fc) in function_calls.into_iter().enumerate() {
-                    let call_id = format!("gemini_call_{}", idx + 1);
-                    let arguments = match serde_json::to_string(&fc.args) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = tx_event.send(Err(CodexErr::Json(e))).await;
-                            return;
-                        }
-                    };
-
-                    let item = ResponseItem::FunctionCall {
-                        id: None,
-                        name: fc.name,
-                        arguments,
-                        call_id,
-                    };
-
-                    if tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-
-                if let Some(item) = reasoning_item.take()
-                    && tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
-
-                let _ = tx_event
-                    .send(Ok(ResponseEvent::Completed {
-                        response_id: String::new(),
-                        token_usage: token_usage.clone(),
-                    }))
-                    .await;
-            }
-            Err(e) => {
-                let err = CodexErr::ConnectionFailed(ConnectionFailedError { source: e });
-                let _ = tx_event.send(Err(err)).await;
-            }
+        if let Err(err) = outcome {
+            manager.see_event_completed_failed(&err);
+            let _ = tx_event.send(Err(err)).await;
         }
     });
 
     Ok(ResponseStream { rx_event })
 }
 
-async fn stream_gemini_streaming(
-    payload: Value,
-    client: &CodexHttpClient,
-    provider: &ModelProviderInfo,
-    otel_event_manager: &OtelEventManager,
-    _auth_manager: &Option<Arc<AuthManager>>,
-) -> Result<ResponseStream> {
-    let auth: Option<crate::auth::CodexAuth> = None;
-    let target_url = provider.get_full_url(&auth);
-    debug!(
-        "Gemini request (streaming) -> {} payload={}",
-        target_url, payload
-    );
-    let mut req_builder = provider.create_request_builder(client, &auth).await?;
+fn build_gemini_request(
+    prompt: &Prompt,
+    model_family: &ModelFamily,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+) -> Result<GenerateContentRequest> {
+    let instructions = prompt.get_full_instructions(model_family).into_owned();
+    let formatted_input = prompt.get_formatted_input();
+    let contents = map_history_to_contents(&formatted_input);
+    let tools = build_tool_declarations(&prompt.tools)?;
+    let generation_config =
+        build_generation_config(reasoning_effort, prompt.output_schema.as_ref());
 
-    req_builder = req_builder
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .json(&payload);
+    let system_instruction = (!instructions.trim().is_empty()).then(|| Content {
+        role: "user".to_string(),
+        parts: vec![Part {
+            text: Some(instructions),
+            inline_data: None,
+            media_resolution: None,
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+        }],
+    });
 
-    let res = otel_event_manager
-        .log_request(0, || req_builder.send())
-        .await;
+    Ok(GenerateContentRequest {
+        contents,
+        tools,
+        generation_config,
+        system_instruction,
+    })
+}
 
-    match res {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
-                    status,
-                    body,
-                    request_id: None,
-                }));
+fn build_generation_config(
+    reasoning_effort: Option<ReasoningEffortConfig>,
+    output_schema: Option<&serde_json::Value>,
+) -> Option<GenerationConfig> {
+    let thinking_level = reasoning_effort.and_then(reasoning_effort_to_thinking_level);
+
+    let (response_mime_type, response_json_schema) = if let Some(schema) = output_schema {
+        (Some("application/json".to_string()), Some(schema.clone()))
+    } else {
+        (None, None)
+    };
+
+    let thinking_config = thinking_level.map(|level| ThinkingConfig {
+        thinking_level: Some(level),
+        thinking_budget: None,
+    });
+
+    if thinking_config.is_none() && response_mime_type.is_none() && response_json_schema.is_none() {
+        return None;
+    }
+
+    Some(GenerationConfig {
+        max_output_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        thinking_config,
+        response_mime_type,
+        response_json_schema,
+        image_config: None,
+    })
+}
+
+fn build_tool_declarations(tools: &[ToolSpec]) -> Result<Option<Vec<Tool>>> {
+    let json_tools = create_tools_json_for_gemini_api(tools)?;
+    if json_tools.is_empty() {
+        return Ok(None);
+    }
+
+    let mut converted = Vec::new();
+    for tool in json_tools {
+        match serde_json::from_value::<Tool>(tool) {
+            Ok(tool) => converted.push(tool),
+            Err(err) => {
+                debug!(?err, "Skipping Gemini tool without function_declarations");
             }
-
-            let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
-
-            let stream = resp.bytes_stream().map_err(|e| {
-                CodexErr::ResponseStreamFailed(ResponseStreamFailed {
-                    source: e,
-                    request_id: None,
-                })
-            });
-
-            tokio::spawn(process_gemini_sse(
-                stream,
-                tx_event,
-                provider.stream_idle_timeout(),
-                otel_event_manager.clone(),
-            ));
-
-            Ok(ResponseStream { rx_event })
         }
-        Err(e) => Err(CodexErr::ConnectionFailed(ConnectionFailedError {
-            source: e,
-        })),
+    }
+    if converted.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(converted))
     }
 }
 
-#[cfg(test)]
-mod live_tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
+fn map_history_to_contents(items: &[ResponseItem]) -> Vec<Content> {
+    let mut contents: Vec<Content> = Vec::new();
+    let mut function_names = HashMap::<String, String>::new();
 
-    use anyhow::Context;
-    use anyhow::Result;
-    use anyhow::anyhow;
-    use codex_app_server_protocol::AuthMode;
-    use codex_otel::otel_event_manager::OtelEventManager;
-    use codex_protocol::ConversationId;
-    use codex_protocol::protocol::SessionSource;
-    use core_test_support::skip_if_no_network;
-    use futures::StreamExt;
-    use pretty_assertions::assert_eq;
-    use serde_json::Value;
-    use tempfile::TempDir;
-
-    use crate::ContentItem;
-    use crate::ModelClient;
-    use crate::Prompt;
-    use crate::ResponseEvent;
-    use crate::ResponseItem;
-    use crate::client_common::tools::ResponsesApiTool;
-    use crate::client_common::tools::ToolSpec;
-    use crate::config::Config;
-    use crate::config::ConfigOverrides;
-    use crate::config::ConfigToml;
-    use crate::gemini_models::create_gemini_provider_for_model;
-    use crate::model_family::derive_default_model_family;
-    use crate::model_family::find_family_for_model;
-    use crate::tools::spec::JsonSchema;
-
-    const RUN_LIVE_ENV: &str = "RUN_LIVE_GEMINI";
-    const API_KEY_ENV: &str = "GEMINI_API_KEY";
-    const DEFAULT_MODEL: &str = "models/gemini-2.5-flash";
-
-    struct LiveClient {
-        client: ModelClient,
-        _config: Arc<Config>,
-    }
-
-    /// Build a Config rooted in a temp Codex home so live calls do not touch
-    /// the user's real state.
-    fn load_live_config(codex_home: &TempDir) -> Option<Config> {
-        Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            codex_home.path().to_path_buf(),
-        )
-        .ok()
-    }
-
-    /// Gate live calls so they only run when explicitly opted in and
-    /// credentials are present.
-    fn should_run_live() -> Option<String> {
-        if std::env::var(RUN_LIVE_ENV).unwrap_or_default() != "1" {
-            eprintln!("skipping live Gemini tests – set {RUN_LIVE_ENV}=1 to enable");
-            return None;
-        }
-
-        if std::env::var(API_KEY_ENV).is_err() {
-            eprintln!("skipping live Gemini tests – {API_KEY_ENV} is not set");
-            return None;
-        }
-
-        let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        Some(model)
-    }
-
-    /// Build a ModelClient pointed at the public Gemini endpoint using the
-    /// provided model slug and the GEMINI_API_KEY header.
-    async fn build_live_client(model: &str) -> Option<LiveClient> {
-        let provider =
-            match create_gemini_provider_for_model(model, "gemini-live", API_KEY_ENV, false) {
-                Some(p) => p,
-                None => {
-                    eprintln!("skipping live Gemini tests – unsupported model slug {model}");
-                    return None;
-                }
-            };
-
-        let codex_home = TempDir::new().ok()?;
-        let mut config = load_live_config(&codex_home)?;
-        config.model = model.to_string();
-        config.model_family = find_family_for_model(&config.model)
-            .unwrap_or_else(|| derive_default_model_family(&config.model));
-        config.model_provider_id = provider.name.clone();
-        config.model_provider = provider.clone();
-        config.show_raw_agent_reasoning = true;
-        let effort = config.model_reasoning_effort;
-        let summary = config.model_reasoning_summary;
-        let config = Arc::new(config);
-
-        let conversation_id = ConversationId::new();
-        let otel_event_manager = OtelEventManager::new(
-            conversation_id,
-            config.model.as_str(),
-            config.model_family.slug.as_str(),
-            None,
-            Some("live@test.com".to_string()),
-            Some(AuthMode::ChatGPT),
-            false,
-            "live".to_string(),
-        );
-
-        let client = ModelClient::new(
-            Arc::clone(&config),
-            None,
-            otel_event_manager,
-            provider,
-            effort,
-            summary,
-            conversation_id,
-            SessionSource::Exec,
-        );
-
-        Some(LiveClient {
-            client,
-            _config: config,
-        })
-    }
-
-    /// Create a Prompt with a single user message and the supplied tool set.
-    fn prompt_with_tools(tools: &[ToolSpec], user_prompt: &str) -> Prompt {
-        let mut prompt = Prompt::default();
-        prompt.input.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: user_prompt.to_string(),
-            }],
-        });
-        prompt.tools = tools.to_vec();
-        prompt
-    }
-
-    /// Common catalog of tools exposed to the live prompt matrix.
-    fn tool_catalog() -> Vec<ToolSpec> {
-        vec![
-            weather_tool(),
-            stock_quote_tool(),
-            create_order_tool(),
-            set_timer_tool(),
-            append_file_tool(),
-            shell_tool(),
-            crate::tools::handlers::PLAN_TOOL.clone(),
-        ]
-    }
-
-    /// Tool spec for basic weather lookup with explicit city + unit fields.
-    fn weather_tool() -> ToolSpec {
-        let mut properties = BTreeMap::new();
-        properties.insert(
-            "city".to_string(),
-            JsonSchema::String {
-                description: Some("City to fetch weather for.".to_string()),
-            },
-        );
-        properties.insert(
-            "unit".to_string(),
-            JsonSchema::String {
-                description: Some("Temperature unit, e.g. celsius.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "get_weather".to_string(),
-            description: "Look up the current weather for a city.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties,
-                required: Some(vec!["city".to_string(), "unit".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Tool spec used to test tool-choice disambiguation for stock lookups.
-    fn stock_quote_tool() -> ToolSpec {
-        let mut properties = BTreeMap::new();
-        properties.insert(
-            "symbol".to_string(),
-            JsonSchema::String {
-                description: Some("Ticker symbol to look up, e.g. AAPL.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "get_stock_quote".to_string(),
-            description: "Fetch a real-time stock quote.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties,
-                required: Some(vec!["symbol".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Tool spec for timers with a numeric duration and optional label.
-    fn set_timer_tool() -> ToolSpec {
-        let mut properties = BTreeMap::new();
-        properties.insert(
-            "minutes".to_string(),
-            JsonSchema::Number {
-                description: Some("How long the timer should run, in minutes.".to_string()),
-            },
-        );
-        properties.insert(
-            "label".to_string(),
-            JsonSchema::String {
-                description: Some("Optional label to show with the timer.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "set_timer".to_string(),
-            description: "Start a countdown timer.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties,
-                required: Some(vec!["minutes".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Tool spec for a nested order payload covering arrays and objects.
-    fn create_order_tool() -> ToolSpec {
-        let mut item_props = BTreeMap::new();
-        item_props.insert(
-            "sku".to_string(),
-            JsonSchema::String {
-                description: Some("Item SKU.".to_string()),
-            },
-        );
-        item_props.insert(
-            "quantity".to_string(),
-            JsonSchema::Number {
-                description: Some("Quantity of the item.".to_string()),
-            },
-        );
-
-        let item_schema = JsonSchema::Object {
-            properties: item_props,
-            required: Some(vec!["sku".to_string(), "quantity".to_string()]),
-            additional_properties: None,
-        };
-
-        let mut shipping_props = BTreeMap::new();
-        shipping_props.insert(
-            "name".to_string(),
-            JsonSchema::String {
-                description: Some("Recipient name.".to_string()),
-            },
-        );
-        shipping_props.insert(
-            "line1".to_string(),
-            JsonSchema::String {
-                description: Some("Street line 1.".to_string()),
-            },
-        );
-        shipping_props.insert(
-            "city".to_string(),
-            JsonSchema::String {
-                description: Some("City.".to_string()),
-            },
-        );
-        shipping_props.insert(
-            "state".to_string(),
-            JsonSchema::String {
-                description: Some("State or province.".to_string()),
-            },
-        );
-        shipping_props.insert(
-            "postal_code".to_string(),
-            JsonSchema::String {
-                description: Some("Postal or ZIP code.".to_string()),
-            },
-        );
-
-        let shipping_schema = JsonSchema::Object {
-            properties: shipping_props,
-            required: Some(vec![
-                "name".to_string(),
-                "line1".to_string(),
-                "city".to_string(),
-                "state".to_string(),
-                "postal_code".to_string(),
-            ]),
-            additional_properties: None,
-        };
-
-        let mut order_props = BTreeMap::new();
-        order_props.insert(
-            "items".to_string(),
-            JsonSchema::Array {
-                items: Box::new(item_schema),
-                description: Some("Order line items.".to_string()),
-            },
-        );
-        order_props.insert("shipping".to_string(), shipping_schema);
-        order_props.insert(
-            "notes".to_string(),
-            JsonSchema::String {
-                description: Some("Optional delivery notes.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "create_order".to_string(),
-            description: "Create a mock order with items and shipping details.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties: order_props,
-                required: Some(vec!["items".to_string(), "shipping".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Tool spec for appending text to a file path.
-    fn append_file_tool() -> ToolSpec {
-        let mut properties = BTreeMap::new();
-        properties.insert(
-            "path".to_string(),
-            JsonSchema::String {
-                description: Some("Path to write.".to_string()),
-            },
-        );
-        properties.insert(
-            "content".to_string(),
-            JsonSchema::String {
-                description: Some("Content to append.".to_string()),
-            },
-        );
-        properties.insert(
-            "mode".to_string(),
-            JsonSchema::String {
-                description: Some("Optional write mode, e.g. append.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "append_file".to_string(),
-            description: "Append text to a file path.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties,
-                required: Some(vec!["path".to_string(), "content".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Tool spec for issuing shell commands.
-    fn shell_tool() -> ToolSpec {
-        let mut properties = BTreeMap::new();
-        properties.insert(
-            "command".to_string(),
-            JsonSchema::String {
-                description: Some("Command to execute.".to_string()),
-            },
-        );
-        properties.insert(
-            "timeout_ms".to_string(),
-            JsonSchema::Number {
-                description: Some("Optional timeout in ms.".to_string()),
-            },
-        );
-
-        ToolSpec::Function(ResponsesApiTool {
-            name: "shell".to_string(),
-            description: "Run a shell command.".to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties,
-                required: Some(vec!["command".to_string()]),
-                additional_properties: None,
-            },
-        })
-    }
-
-    /// Run a prompt against Gemini and collect the full event stream.
-    async fn execute_prompt(client: &ModelClient, prompt: Prompt) -> Result<Vec<ResponseEvent>> {
-        let mut stream = client.stream(&prompt).await?;
-        let mut events = Vec::new();
-
-        while let Some(event) = stream.next().await {
-            events.push(event?);
-        }
-
-        Ok(events)
-    }
-
-    /// Pick the first function call from the stream and parse its JSON args.
-    fn extract_function_call(events: &[ResponseEvent]) -> Result<(String, Value)> {
-        let (name, args) = events
-            .iter()
-            .find_map(|event| match event {
-                ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                    name,
-                    arguments,
-                    ..
-                }) => Some((name.clone(), arguments.clone())),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow!("response did not contain a function call"))?;
-
-        let parsed: Value = serde_json::from_str(&args)?;
-        Ok((name, parsed))
-    }
-
-    /// Coerce JSON numeric values into i64 for easier equality checks.
-    fn round_to_i64(value: &Value) -> Option<i64> {
-        value
-            .as_i64()
-            .or_else(|| value.as_f64().map(|v| v.round() as i64))
-    }
-
-    /// Single prompt + expectation for the live Gemini matrix.
-    struct LiveCase {
-        name: &'static str,
-        prompt: String,
-        expected_tool: &'static str,
-        assert_args: Box<dyn Fn(&Value) + Send + Sync>,
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
-    async fn live_gemini_function_calls() -> Result<()> {
-        skip_if_no_network!(Ok(()));
-        let Some(model) = should_run_live() else {
-            return Ok(());
-        };
-        let Some(LiveClient { client, .. }) = build_live_client(&model).await else {
-            return Ok(());
-        };
-
-        let tools = tool_catalog();
-        let cases = vec![
-            LiveCase {
-                name: "weather_paris",
-                prompt: "Use the get_weather(city, unit) function to fetch the weather for Paris in celsius. Respond only with a function call."
-                    .to_string(),
-                expected_tool: "get_weather",
-                assert_args: Box::new(|args| {
-                    let city = args
-                        .get("city")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    assert_eq!(city, "paris");
-
-                    let unit = args
-                        .get("unit")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let normalized = unit.to_lowercase();
-                    assert!(
-                        normalized.contains('c'),
-                        "expected Celsius unit, got {unit:?}"
-                    );
-                }),
-            },
-            LiveCase {
-                name: "stock_disambiguation",
-                prompt: "Choose the best tool to return the stock quote for AAPL. Tools available: get_weather(city, unit) and get_stock_quote(symbol). Return only the tool call."
-                    .to_string(),
-                expected_tool: "get_stock_quote",
-                assert_args: Box::new(|args| {
-                    let symbol = args
-                        .get("symbol")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_uppercase();
-                    assert_eq!(symbol, "AAPL");
-                }),
-            },
-            LiveCase {
-                name: "create_order_structured",
-                prompt: "Place an order via create_order(items, shipping, notes). Add 2 units of sku abc-123 and 1 unit of sku orange-456. Ship to Grace Hopper at 123 Harbor Road, Oakland, CA 94607. Delivery notes should say 'leave at front desk'. Respond only with a function call."
-                    .to_string(),
-                expected_tool: "create_order",
-                assert_args: Box::new(|args| {
-                    let empty_items = Vec::new();
-                    let items = args
-                        .get("items")
-                        .and_then(Value::as_array)
-                        .unwrap_or(&empty_items);
-                    assert_eq!(items.len(), 2, "expected two items, got {items:?}");
-
-                    let first = items.first().unwrap_or(&Value::Null);
-                    assert_eq!(
-                        first.get("sku").and_then(Value::as_str),
-                        Some("abc-123")
-                    );
-                    let first_qty = first.get("quantity").and_then(round_to_i64);
-                    assert_eq!(first_qty, Some(2));
-
-                    let second = items.get(1).unwrap_or(&Value::Null);
-                    assert_eq!(
-                        second.get("sku").and_then(Value::as_str),
-                        Some("orange-456")
-                    );
-                    let second_qty = second.get("quantity").and_then(round_to_i64);
-                    assert_eq!(second_qty, Some(1));
-
-                    let empty_map = serde_json::Map::new();
-                    let shipping = args
-                        .get("shipping")
-                        .and_then(Value::as_object)
-                        .unwrap_or(&empty_map);
-                    assert_eq!(shipping.get("city").and_then(Value::as_str), Some("Oakland"));
-                    assert_eq!(shipping.get("state").and_then(Value::as_str), Some("CA"));
-                    assert_eq!(
-                        shipping.get("postal_code").and_then(Value::as_str),
-                        Some("94607")
-                    );
-                    assert_eq!(
-                        shipping.get("name").and_then(Value::as_str),
-                        Some("Grace Hopper")
-                    );
-
-                    if let Some(notes) = args.get("notes").and_then(Value::as_str) {
-                        assert!(
-                            notes.to_lowercase().contains("front"),
-                            "expected notes to mention delivery instructions"
-                        );
-                    }
-                }),
-            },
-            LiveCase {
-                name: "timer_normalization",
-                prompt: "Use the set_timer(minutes, label) function to start a timer for \"ten minuttes\" while I steep green tea. Normalize the duration to a numeric value in minutes and respond only with a function call."
-                    .to_string(),
-                expected_tool: "set_timer",
-                assert_args: Box::new(|args| {
-                    let minutes_value = args.get("minutes").unwrap_or(&Value::Null);
-                    let minutes = round_to_i64(minutes_value).unwrap_or_default();
-                    assert_eq!(minutes, 10);
-
-                    if let Some(label) = args.get("label").and_then(Value::as_str) {
-                        assert!(
-                            label.to_lowercase().contains("tea"),
-                            "expected label to mention tea"
-                        );
-                    }
-                }),
-            },
-            LiveCase {
-                name: "append_file",
-                prompt: "Call append_file(path, content, mode) to append 'hello from live' to /tmp/gemini-live.txt with mode \"append\". Respond only with a function call."
-                    .to_string(),
-                expected_tool: "append_file",
-                assert_args: Box::new(|args| {
-                    assert_eq!(
-                        args.get("path").and_then(Value::as_str),
-                        Some("/tmp/gemini-live.txt")
-                    );
-                    assert_eq!(
-                        args.get("content").and_then(Value::as_str),
-                        Some("hello from live")
-                    );
-                    assert_eq!(
-                        args.get("mode").and_then(Value::as_str),
-                        Some("append")
-                    );
-                }),
-            },
-            LiveCase {
-                name: "shell_ls",
-                prompt: "Call shell(command, timeout_ms) to list /tmp with a 2000ms timeout. Respond only with a function call."
-                    .to_string(),
-                expected_tool: "shell",
-                assert_args: Box::new(|args| {
-                    assert_eq!(args.get("command").and_then(Value::as_str), Some("ls /tmp"));
-                    let timeout = round_to_i64(args.get("timeout_ms").unwrap_or(&Value::Null)).unwrap_or(0);
-                    assert!(
-                        (1_000..=10_000).contains(&timeout),
-                        "timeout should be reasonable, got {timeout}"
-                    );
-                }),
-            },
-            LiveCase {
-                name: "plan_create",
-                prompt: "Call update_plan(plan) to create a 2-step plan: step1='Collect files', step2='Summarize changes'. Mark step1 in_progress and step2 pending. Respond only with the function call."
-                    .to_string(),
-                expected_tool: "update_plan",
-                assert_args: Box::new(|args| {
-                    let steps = args
-                        .get("plan")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    assert_eq!(steps.len(), 2, "expected 2 plan items");
-                    let statuses: Vec<_> = steps
-                        .iter()
-                        .map(|s| s.get("status").and_then(Value::as_str).unwrap_or_default())
-                        .collect();
-                    assert_eq!(statuses[0], "in_progress");
-                    assert_eq!(statuses[1], "pending");
-                    let step_texts: Vec<_> = steps
-                        .iter()
-                        .map(|s| s.get("step").and_then(Value::as_str).unwrap_or_default())
-                        .collect();
-                    assert!(
-                        step_texts[0].to_lowercase().contains("collect"),
-                        "step 1 should mention collect"
-                    );
-                    assert!(
-                        step_texts[1].to_lowercase().contains("summarize"),
-                        "step 2 should mention summarize"
-                    );
-                }),
-            },
-            LiveCase {
-                name: "plan_update",
-                prompt: "Update the plan via update_plan: mark step1 completed, step2 in_progress, and add a pending step3 'Ship changes'. Respond only with the function call."
-                    .to_string(),
-                expected_tool: "update_plan",
-                assert_args: Box::new(|args| {
-                    let steps = args
-                        .get("plan")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    assert_eq!(steps.len(), 3, "expected 3 plan items");
-                    let statuses: Vec<_> = steps
-                        .iter()
-                        .map(|s| s.get("status").and_then(Value::as_str).unwrap_or_default())
-                        .collect();
-                    assert_eq!(statuses[0], "completed");
-                    assert_eq!(statuses[1], "in_progress");
-                    assert_eq!(statuses[2], "pending");
-                    let step3 = steps
-                        .get(2)
-                        .and_then(|s| s.get("step").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    assert!(
-                        step3.contains("ship"),
-                        "step 3 should mention ship changes, got {step3}"
-                    );
-                }),
-            },
-        ];
-
-        for case in cases {
-            let prompt = prompt_with_tools(&tools, &case.prompt);
-            println!(
-                "live_gemini sending case={} model={} prompt={}",
-                case.name, model, case.prompt
-            );
-            let events = execute_prompt(&client, prompt)
-                .await
-                .with_context(|| format!("case {} failed to stream from Gemini", case.name))?;
-            assert!(
-                events
+    for item in items {
+        let (role, new_parts) = match item {
+            ResponseItem::Message {
+                role,
+                content,
+                thought_signature,
+                ..
+            } => {
+                let mut parts = content
                     .iter()
-                    .any(|ev| matches!(ev, ResponseEvent::Completed { .. })),
-                "case {} did not finish the stream",
-                case.name
-            );
-
-            let (tool_name, args) =
-                extract_function_call(&events).with_context(|| format!("case {}", case.name))?;
-            assert_eq!(
-                tool_name, case.expected_tool,
-                "case {} should call the expected tool",
-                case.name
-            );
-            (case.assert_args)(&args);
-            println!(
-                "live_gemini case={} tool={} args={}",
-                case.name,
-                tool_name,
-                serde_json::to_string_pretty(&args).unwrap_or_else(|_| "<unprintable>".to_string())
-            );
-        }
-
-        Ok(())
-    }
-}
-
-async fn append_reasoning_text(
-    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
-    reasoning_item: &mut Option<ResponseItem>,
-    text: String,
-) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-
-    if reasoning_item.is_none() {
-        let item = ResponseItem::Reasoning {
-            id: "gemini_reasoning_1".to_string(),
-            summary: vec![ReasoningItemReasoningSummary::SummaryText {
-                text: String::new(),
-            }],
-            content: Some(Vec::new()),
-            encrypted_content: None,
+                    .flat_map(content_item_to_parts)
+                    .collect::<Vec<_>>();
+                if parts.is_empty() {
+                    continue;
+                }
+                if let Some(sig) = thought_signature
+                    && let Some(last) = parts.last_mut()
+                {
+                    last.thought_signature = Some(sig.clone());
+                }
+                (map_role(role), parts)
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                thought_signature,
+                ..
+            } => {
+                function_names.insert(call_id.clone(), name.clone());
+                let args =
+                    serde_json::from_str(arguments).unwrap_or(Value::String(arguments.clone()));
+                let part = Part {
+                    text: None,
+                    inline_data: None,
+                    media_resolution: None,
+                    function_call: Some(FunctionCall {
+                        name: name.clone(),
+                        args,
+                    }),
+                    function_response: None,
+                    thought_signature: thought_signature.clone(),
+                };
+                ("model".to_string(), vec![part])
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                let name = function_names
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| call_id.clone());
+                let part = Part {
+                    text: None,
+                    inline_data: None,
+                    media_resolution: None,
+                    function_call: None,
+                    function_response: Some(FunctionResponse {
+                        name,
+                        response: build_function_response_payload(output),
+                    }),
+                    thought_signature: None,
+                };
+                ("user".to_string(), vec![part])
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                let part = Part {
+                    text: Some(format!("Custom tool {call_id} result:\n{output}")),
+                    inline_data: None,
+                    media_resolution: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                };
+                ("user".to_string(), vec![part])
+            }
+            _ => continue,
         };
-        if tx_event
-            .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        *reasoning_item = Some(item);
-    }
 
-    if let Some(ResponseItem::Reasoning {
-        summary, content, ..
-    }) = reasoning_item
-    {
-        if let Some(ReasoningItemReasoningSummary::SummaryText { text: summary_text }) =
-            summary.first_mut()
+        if let Some(last) = contents.last_mut()
+            && last.role == role
         {
-            summary_text.push_str(&text);
-            if tx_event
-                .send(Ok(ResponseEvent::ReasoningSummaryDelta {
-                    delta: text.clone(),
-                    summary_index: 0,
-                }))
-                .await
-                .is_err()
-            {
-                return false;
-            }
-        }
-
-        if let Some(content_items) = content {
-            content_items.push(ReasoningItemContent::ReasoningText { text: text.clone() });
-            let content_index = content_items.len() as i64 - 1;
-            if tx_event
-                .send(Ok(ResponseEvent::ReasoningContentDelta {
-                    delta: text,
-                    content_index,
-                }))
-                .await
-                .is_err()
-            {
-                return false;
-            }
+            last.parts.extend(new_parts);
+        } else {
+            contents.push(Content {
+                role,
+                parts: new_parts,
+            });
         }
     }
 
-    true
+    contents
+}
+fn content_item_to_parts(item: &ContentItem) -> Vec<Part> {
+    match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => vec![Part {
+            text: Some(text.clone()),
+            inline_data: None,
+            media_resolution: None,
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+        }],
+        ContentItem::InputImage { image_url } => {
+            if let Some(blob) = inline_data_from_image_url(image_url) {
+                vec![Part {
+                    text: None,
+                    inline_data: Some(blob),
+                    media_resolution: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                }]
+            } else {
+                vec![Part {
+                    text: Some(format!("Image: {image_url}")),
+                    inline_data: None,
+                    media_resolution: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                }]
+            }
+        }
+    }
 }
 
-async fn append_assistant_text(
-    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
-    assistant_item: &mut Option<ResponseItem>,
-    text: String,
-) -> bool {
-    if text.is_empty() {
-        return true;
+fn inline_data_from_image_url(url: &str) -> Option<Blob> {
+    let stripped = url.strip_prefix("data:")?;
+    let (mime, encoded) = stripped.split_once(";base64,")?;
+    Some(Blob {
+        mime_type: mime.to_string(),
+        data: encoded.to_string(),
+    })
+}
+
+fn build_function_response_payload(payload: &FunctionCallOutputPayload) -> Value {
+    if let Some(items) = &payload.content_items {
+        let content = items
+            .iter()
+            .map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Value::Object(
+                    [("text".to_string(), Value::String(text.clone()))]
+                        .into_iter()
+                        .collect(),
+                ),
+                FunctionCallOutputContentItem::InputImage { image_url } => {
+                    if let Some(blob) = inline_data_from_image_url(image_url) {
+                        Value::Object(
+                            [(
+                                "inlineData".to_string(),
+                                serde_json::json!({
+                                    "mimeType": blob.mime_type,
+                                    "data": blob.data
+                                }),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        )
+                    } else {
+                        Value::Object(
+                            [("text".to_string(), Value::String(image_url.clone()))]
+                                .into_iter()
+                                .collect(),
+                        )
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({ "content": content })
+    } else {
+        serde_json::json!({
+            "content": [ { "text": payload.content } ]
+        })
+    }
+}
+
+fn map_role(role: &str) -> String {
+    match role {
+        "assistant" => "model".to_string(),
+        _ => role.to_string(),
+    }
+}
+
+async fn process_json_response(
+    response: Response,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    otel_event_manager: OtelEventManager,
+) -> Result<()> {
+    let request_id = extract_request_id(response.headers());
+    let body = response.bytes().await.map_err(|err| {
+        CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+            source: err,
+            request_id: request_id.clone(),
+        })
+    })?;
+    let parsed: crate::gemini_models::GenerateContentResponse = serde_json::from_slice(&body)?;
+
+    let mut text_state = GeminiTextState::default();
+    let mut call_tracker = GeminiCallTracker::default();
+
+    if let Some(candidates) = parsed.candidates
+        && let Some(candidate) = candidates.into_iter().next()
+        && let Some(content) = candidate.content
+        && !process_parts(
+            &content.parts,
+            &tx_event,
+            &mut text_state,
+            &mut call_tracker,
+        )
+        .await?
+    {
+        return Ok(());
     }
 
-    if assistant_item.is_none() {
+    if !text_state.flush(&tx_event).await? {
+        return Ok(());
+    }
+
+    let token_usage = parsed
+        .usage_metadata
+        .and_then(|meta| usage_from_metadata(&meta));
+    if let Some(usage) = &token_usage {
+        otel_event_manager.sse_event_completed(
+            usage.input_tokens,
+            usage.output_tokens,
+            Some(usage.cached_input_tokens),
+            Some(usage.reasoning_output_tokens),
+            usage.total_tokens,
+        );
+    }
+
+    let completed = ResponseEvent::Completed {
+        response_id: Uuid::new_v4().to_string(),
+        token_usage,
+    };
+    let _ = tx_event.send(Ok(completed)).await;
+
+    Ok(())
+}
+
+async fn process_sse_response(
+    response: Response,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    otel_event_manager: OtelEventManager,
+) -> Result<()> {
+    let mut stream = response.bytes_stream().eventsource();
+    let mut text_state = GeminiTextState::default();
+    let mut call_tracker = GeminiCallTracker::default();
+    let mut token_usage: Option<TokenUsage> = None;
+    let mut saw_done = false;
+    let mut received_payload = false;
+    let mut saw_event = false;
+    let mut last_error: Option<CodexErr> = None;
+
+    while let Some(event) = stream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                return Err(CodexErr::Stream(format!("Gemini SSE error: {err}"), None));
+            }
+        };
+
+        let data = event.data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            saw_done = true;
+            break;
+        }
+
+        let envelope = match serde_json::from_str::<GeminiStreamEnvelope>(data) {
+            Ok(env) => env,
+            Err(err) => {
+                if let Ok(error_env) = serde_json::from_str::<ErrorEnvelope>(data)
+                    && let Some(error) = error_env.error
+                {
+                    debug!(
+                        code = error.code,
+                        status = error.status,
+                        message = error.message,
+                        "Gemini stream error envelope"
+                    );
+                    let status = http::StatusCode::from_u16(error.code as u16)
+                        .unwrap_or(http::StatusCode::BAD_REQUEST);
+                    last_error = Some(CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                        status,
+                        body: error.message,
+                        request_id: None,
+                    }));
+                    return Err(last_error.unwrap());
+                }
+                debug!(%err, %data, "Failed to parse Gemini SSE chunk");
+                continue;
+            }
+        };
+
+        let result = match envelope {
+            GeminiStreamEnvelope::Wrapped { result } => result,
+            GeminiStreamEnvelope::Unwrapped(result) => result,
+        };
+        saw_event = true;
+
+        if let Some(meta) = result.usage_metadata {
+            token_usage = usage_from_metadata(&meta);
+            received_payload = true;
+        }
+        if let Some(candidates) = result.candidates.as_ref() {
+            for candidate in candidates {
+                if let Some(content) = candidate.content.as_ref() {
+                    received_payload = true;
+                    if !process_parts(
+                        &content.parts,
+                        &tx_event,
+                        &mut text_state,
+                        &mut call_tracker,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    if !saw_done && !received_payload {
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        if !saw_event {
+            return Err(CodexErr::Stream(
+                "Gemini stream closed before completion".to_string(),
+                None,
+            ));
+        }
+        debug!("Gemini stream ended without payload; completing without content");
+    }
+
+    if !text_state.flush(&tx_event).await? {
+        return Ok(());
+    }
+
+    if let Some(usage) = &token_usage {
+        otel_event_manager.sse_event_completed(
+            usage.input_tokens,
+            usage.output_tokens,
+            Some(usage.cached_input_tokens),
+            Some(usage.reasoning_output_tokens),
+            usage.total_tokens,
+        );
+    }
+
+    let completed = ResponseEvent::Completed {
+        response_id: Uuid::new_v4().to_string(),
+        token_usage,
+    };
+    let _ = tx_event.send(Ok(completed)).await;
+
+    Ok(())
+}
+
+async fn process_parts(
+    parts: &[Part],
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    text_state: &mut GeminiTextState,
+    call_tracker: &mut GeminiCallTracker,
+) -> Result<bool> {
+    for part in parts {
+        if let Some(text) = &part.text {
+            text_state.note_thought_signature(part.thought_signature.clone());
+            if !text_state.push_text(tx_event, text).await? {
+                return Ok(false);
+            }
+        } else if part.thought_signature.is_some() {
+            text_state.note_thought_signature(part.thought_signature.clone());
+            if !text_state.ensure_started(tx_event).await? {
+                return Ok(false);
+            }
+        }
+
+        if let Some(call) = &part.function_call {
+            if !text_state.flush(tx_event).await? {
+                return Ok(false);
+            }
+            let call_id = call_tracker.next_call_id();
+            if !emit_function_call(tx_event, call, &call_id, part.thought_signature.clone()).await?
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn usage_from_metadata(meta: &UsageMetadata) -> Option<TokenUsage> {
+    let input = meta.prompt_token_count?;
+    let output = meta.candidates_token_count.unwrap_or(0);
+    let total = meta.total_token_count.unwrap_or(input + output);
+    Some(TokenUsage {
+        input_tokens: input,
+        cached_input_tokens: 0,
+        output_tokens: output,
+        reasoning_output_tokens: 0,
+        total_tokens: total,
+    })
+}
+
+async fn emit_function_call(
+    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    call: &FunctionCall,
+    call_id: &str,
+    thought_signature: Option<String>,
+) -> Result<bool> {
+    let arguments = serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".to_string());
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: call.name.clone(),
+        arguments,
+        call_id: call_id.to_string(),
+        thought_signature,
+    };
+    let sent = tx_event
+        .send(Ok(ResponseEvent::OutputItemDone(item)))
+        .await
+        .is_ok();
+    Ok(sent)
+}
+
+#[derive(Default)]
+struct GeminiTextState {
+    buffer: String,
+    active: bool,
+    thought_signature: Option<String>,
+}
+
+impl GeminiTextState {
+    fn note_thought_signature(&mut self, thought_signature: Option<String>) {
+        if let Some(sig) = thought_signature {
+            self.thought_signature = Some(sig);
+        }
+    }
+
+    async fn ensure_started(
+        &mut self,
+        tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+    ) -> Result<bool> {
+        if self.active {
+            return Ok(true);
+        }
+
         let item = ResponseItem::Message {
             id: None,
             role: "assistant".to_string(),
-            content: Vec::new(),
+            content: vec![ContentItem::OutputText {
+                text: String::new(),
+            }],
+            thought_signature: None,
         };
         if tx_event
-            .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+            .send(Ok(ResponseEvent::OutputItemAdded(item)))
             .await
             .is_err()
         {
-            return false;
+            return Ok(false);
         }
-        *assistant_item = Some(item);
+        self.active = true;
+        Ok(true)
     }
 
-    if let Some(ResponseItem::Message { content, .. }) = assistant_item {
-        content.push(ContentItem::OutputText { text: text.clone() });
-        if tx_event
-            .send(Ok(ResponseEvent::OutputTextDelta(text)))
+    async fn push_text(
+        &mut self,
+        tx_event: &mpsc::Sender<Result<ResponseEvent>>,
+        text: &str,
+    ) -> Result<bool> {
+        if text.is_empty() {
+            return Ok(true);
+        }
+        if !self.active && !self.ensure_started(tx_event).await? {
+            return Ok(false);
+        }
+
+        self.buffer.push_str(text);
+        let sent = tx_event
+            .send(Ok(ResponseEvent::OutputTextDelta(text.to_string())))
             .await
-            .is_err()
-        {
-            return false;
-        }
+            .is_ok();
+        Ok(sent)
     }
 
-    true
+    async fn flush(&mut self, tx_event: &mpsc::Sender<Result<ResponseEvent>>) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
+        let text = std::mem::take(&mut self.buffer);
+        let thought_signature = self.thought_signature.take();
+        let item = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText { text }],
+            thought_signature,
+        };
+        self.active = false;
+        Ok(tx_event
+            .send(Ok(ResponseEvent::OutputItemDone(item)))
+            .await
+            .is_ok())
+    }
+}
+
+struct GeminiCallTracker {
+    next: usize,
+}
+
+impl Default for GeminiCallTracker {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+
+impl GeminiCallTracker {
+    fn next_call_id(&mut self) -> String {
+        let current = self.next;
+        self.next += 1;
+        format!("gemini_call_{current}")
+    }
+}
+
+fn reasoning_effort_to_thinking_level(effort: ReasoningEffortConfig) -> Option<String> {
+    match effort {
+        ReasoningEffortConfig::None => None,
+        ReasoningEffortConfig::Minimal | ReasoningEffortConfig::Low => Some("LOW".to_string()),
+        ReasoningEffortConfig::Medium
+        | ReasoningEffortConfig::High
+        | ReasoningEffortConfig::XHigh => Some("HIGH".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GeminiStreamEnvelope {
+    Wrapped { result: GeminiStreamResult },
+    Unwrapped(GeminiStreamResult),
+}
+
+#[derive(Deserialize)]
+struct GeminiStreamResult {
+    #[serde(default)]
+    candidates: Option<Vec<crate::gemini_models::Candidate>>,
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<UsageMetadata>,
+}
+
+fn extract_request_id(headers: &HeaderMap) -> Option<String> {
+    const REQUEST_ID_CANDIDATES: &[&str] = &["x-request-id", "x-oai-request-id", "cf-ray"];
+    for header in REQUEST_ID_CANDIDATES {
+        let name = HeaderName::from_static(header);
+        if let Some(value) = headers.get(&name)
+            && let Ok(parsed) = value.to_str()
+        {
+            return Some(parsed.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
-mod gemini_tests {
+mod tests {
     use super::*;
-    use crate::client_common::Prompt;
-    use crate::model_family::derive_default_model_family;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
 
-    #[test]
-    fn parse_gemini_response_handles_text_and_function_call() {
-        let json = json!({
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            { "text": "Hello " },
-                            {
-                                "functionCall": {
-                                    "name": "do_something",
-                                    "args": { "x": 1 }
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        });
+    const GEMINI_THOUGHT_SIGNATURE_PREFIX: &str = "codex_thought_sig_";
 
-        let parsed = parse_gemini_response(&json);
-        assert_eq!(parsed.text.as_deref(), Some("Hello "));
-        assert_eq!(parsed.function_calls.len(), 1);
-        assert_eq!(parsed.function_calls[0].name, "do_something");
-        assert_eq!(parsed.function_calls[0].args["x"], json!(1));
+    fn thought_signature_for(call_id: &str) -> String {
+        let raw = if call_id.starts_with(GEMINI_THOUGHT_SIGNATURE_PREFIX) {
+            call_id.to_string()
+        } else {
+            format!("{GEMINI_THOUGHT_SIGNATURE_PREFIX}{call_id}")
+        };
+        STANDARD_NO_PAD.encode(raw.as_bytes())
     }
 
     #[test]
-    fn parse_gemini_response_handles_top_level_function_calls() {
-        let json = json!({
-            "functionCalls": [
-                {
-                    "name": "top_level",
-                    "args": { "a": "b" }
-                }
-            ]
-        });
-
-        let parsed = parse_gemini_response(&json);
-        assert!(parsed.text.is_none());
-        assert_eq!(parsed.function_calls.len(), 1);
-        assert_eq!(parsed.function_calls[0].name, "top_level");
-        assert_eq!(parsed.function_calls[0].args["a"], json!("b"));
+    fn parses_stream_candidates() {
+        let raw = r#"{"result":{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}}"#;
+        let envelope: GeminiStreamEnvelope = serde_json::from_str(raw).expect("parse");
+        let result = match envelope {
+            GeminiStreamEnvelope::Wrapped { result } => result,
+            GeminiStreamEnvelope::Unwrapped(result) => result,
+        };
+        let candidates = result.candidates.expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        let content = candidates[0].content.as_ref().expect("content");
+        assert_eq!(content.parts.len(), 1);
+        assert_eq!(content.parts[0].text.as_deref(), Some("Hi"));
     }
 
     #[test]
-    fn parse_gemini_response_extracts_thought_parts() {
-        let json = json!({
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            { "thought": "Consider inputs. " },
-                            { "text": "Finalize." }
-                        ]
-                    }
-                }
-            ]
-        });
+    fn parses_unwrapped_stream_candidates() {
+        let raw = r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}"#;
+        let envelope: GeminiStreamEnvelope = serde_json::from_str(raw).expect("parse");
+        let result = match envelope {
+            GeminiStreamEnvelope::Wrapped { result } => result,
+            GeminiStreamEnvelope::Unwrapped(result) => result,
+        };
+        let candidates = result.candidates.expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        let content = candidates[0].content.as_ref().expect("content");
+        assert_eq!(content.parts[0].text.as_deref(), Some("Hello"));
+    }
 
-        let parsed = parse_gemini_response(&json);
-        assert_eq!(
-            parsed.reasoning.as_deref(),
-            Some("Consider inputs. "),
-            "expected reasoning to include thought text"
-        );
-        assert_eq!(
-            parsed.text.as_deref(),
-            Some("Finalize."),
-            "expected text to include non-thinking content"
+    #[test]
+    fn thought_signature_is_base64_encoded() {
+        let sig = thought_signature_for("gemini_call_1");
+        let decoded = STANDARD_NO_PAD
+            .decode(sig.as_bytes())
+            .expect("base64 decode");
+        let decoded = String::from_utf8(decoded).expect("utf8");
+        assert!(decoded.contains("gemini_call_1"), "{decoded}");
+        assert!(
+            decoded.starts_with(GEMINI_THOUGHT_SIGNATURE_PREFIX),
+            "{decoded}"
         );
     }
+}
 
-    #[test]
-    fn build_gemini_contents_maps_roles_and_tool_outputs() {
-        let mut items = Vec::<ResponseItem>::new();
-
-        // User message
-        items.push(ResponseItem::Message {
+#[test]
+fn test_history_mapping_parallel_calls_and_outputs() {
+    let items = vec![
+        ResponseItem::FunctionCall {
             id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "hi there".to_string(),
-            }],
-        });
-
-        // Assistant message
-        items.push(ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "ok".to_string(),
-            }],
-        });
-
-        // Tool output, both as FunctionCallOutput and CustomToolCallOutput.
-        items.push(ResponseItem::FunctionCall {
-            id: None,
-            name: "write_file".to_string(),
+            name: "fc1".to_string(),
             arguments: "{}".to_string(),
-            call_id: "call-1".to_string(),
-        });
-        items.push(ResponseItem::FunctionCallOutput {
-            call_id: "call-1".to_string(),
-            output: codex_protocol::models::FunctionCallOutputPayload {
-                content: "result-1".to_string(),
+            call_id: "call_1".to_string(),
+            thought_signature: Some("sig1".to_string()),
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "fc2".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call_2".to_string(),
+            thought_signature: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: FunctionCallOutputPayload {
+                content: "out1".to_string(),
                 ..Default::default()
             },
-        });
-        items.push(ResponseItem::CustomToolCallOutput {
-            call_id: "call-2".to_string(),
-            output: "result-2".to_string(),
-        });
+            thought_signature: Some("sig1".to_string()),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call_2".to_string(),
+            output: FunctionCallOutputPayload {
+                content: "out2".to_string(),
+                ..Default::default()
+            },
+            thought_signature: None,
+        },
+    ];
 
-        let contents = build_gemini_contents(&items);
-        assert!(!contents.is_empty(), "expected contents to be non-empty");
+    let contents = map_history_to_contents(&items);
 
-        // First content should be user role carrying the initial text.
-        assert_eq!(contents[0]["role"], json!("user"));
-        let first_text = contents[0]["parts"][0]["text"].as_str().unwrap_or_default();
-        assert!(
-            first_text.contains("hi there"),
-            "expected first content to include user text"
-        );
+    let model_contents: Vec<_> = contents.iter().filter(|c| c.role == "model").collect();
+    assert_eq!(model_contents.len(), 1, "Expected 1 merged model content");
+    assert_eq!(
+        model_contents[0].parts.len(),
+        2,
+        "Expected 2 parts in merged content"
+    );
 
-        // There should be a model role entry.
-        assert!(
-            contents.iter().any(|c| c["role"] == json!("model")),
-            "expected at least one model role content"
-        );
+    let user_contents: Vec<_> = contents.iter().filter(|c| c.role == "user").collect();
+    assert_eq!(user_contents.len(), 1, "Expected 1 merged user content");
+    assert_eq!(
+        user_contents[0].parts.len(),
+        2,
+        "Expected 2 parts in merged content"
+    );
 
-        let function_entry = contents
-            .iter()
-            .find(|c| c["role"] == json!("function"))
-            .expect("expected a function role content entry");
-        let function_response = function_entry["parts"][0]["functionResponse"]
-            .as_object()
-            .expect("functionResponse part should exist");
-        assert_eq!(
-            function_response.get("name"),
-            Some(&json!("write_file")),
-            "functionResponse must carry the tool name"
-        );
-        let response_content = function_response
-            .get("response")
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            response_content.contains("result-1"),
-            "expected function output content to be present"
-        );
-
-        let has_custom_output = contents.iter().any(|c| {
-            c["parts"].as_array().is_some_and(|parts| {
-                parts.iter().any(|p| {
-                    p.get("text")
-                        .and_then(Value::as_str)
-                        .map(|t| t.contains("Custom tool call-2 result:\nresult-2"))
-                        .unwrap_or(false)
-                })
-            })
-        });
-        assert!(
-            has_custom_output,
-            "expected custom tool output to be present"
-        );
-    }
-
-    #[test]
-    fn build_gemini_payload_includes_system_instruction_and_contents() {
-        let model = "models/gemini-2.0-flash";
-        let family = derive_default_model_family(model);
-
-        let mut prompt = Prompt::default();
-        prompt.input = vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "test".to_string(),
-            }],
-        }];
-
-        let payload = build_gemini_payload(&prompt, &family).expect("payload");
-
-        assert!(payload.get("contents").is_some(), "contents missing");
-        assert!(
-            payload.get("systemInstruction").is_some(),
-            "systemInstruction missing"
-        );
-        let safety = payload
-            .get("safetySettings")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            !safety.is_empty(),
-            "safetySettings should be present to relax harmful content filters"
-        );
-    }
-
-    #[test]
-    fn extract_token_usage_reads_usage_metadata() {
-        let json = json!({
-            "usageMetadata": {
-                "promptTokenCount": 10,
-                "candidatesTokenCount": 4,
-                "totalTokenCount": 14
-            }
-        });
-
-        let usage = extract_token_usage(&json).expect("usage metadata");
-        assert_eq!(usage.input_tokens, 10);
-        assert_eq!(usage.output_tokens, 4);
-        assert_eq!(usage.total_tokens, 14);
-    }
+    let out1 = &user_contents[0].parts[0];
+    assert_eq!(
+        out1.thought_signature.as_deref(),
+        None,
+        "User output 1 should NOT have signature"
+    );
 }

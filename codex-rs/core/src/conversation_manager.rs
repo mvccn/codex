@@ -247,6 +247,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            thought_signature: None,
         }
     }
     fn assistant_msg(text: &str) -> ResponseItem {
@@ -256,6 +257,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            thought_signature: None,
         }
     }
 
@@ -280,6 +282,7 @@ mod tests {
                 name: "tool".to_string(),
                 arguments: "{}".to_string(),
                 call_id: "c1".to_string(),
+                thought_signature: None,
             },
             assistant_msg("a4"),
         ];

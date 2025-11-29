@@ -1226,6 +1226,7 @@ impl From<CompactedItem> for ResponseItem {
             content: vec![ContentItem::OutputText {
                 text: value.message,
             }],
+            thought_signature: None,
         }
     }
 }

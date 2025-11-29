@@ -106,6 +106,7 @@ impl ToolCallRuntime {
                     content: Self::abort_message(call, secs),
                     ..Default::default()
                 },
+                thought_signature: None,
             },
         }
     }

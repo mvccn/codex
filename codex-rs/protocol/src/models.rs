@@ -21,10 +21,16 @@ pub enum ResponseInputItem {
     Message {
         role: String,
         content: Vec<ContentItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        thought_signature: Option<String>,
     },
     FunctionCallOutput {
         call_id: String,
         output: FunctionCallOutputPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        thought_signature: Option<String>,
     },
     McpToolCallOutput {
         call_id: String,
@@ -53,6 +59,9 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        thought_signature: Option<String>,
     },
     Reasoning {
         #[serde(default, skip_serializing)]
@@ -85,6 +94,9 @@ pub enum ResponseItem {
         // Chat Completions + Responses API behavior.
         arguments: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        thought_signature: Option<String>,
     },
     // NOTE: The input schema for `function_call_output` objects that clients send to the
     // OpenAI /v1/responses endpoint is NOT the same shape as the objects the server returns on the
@@ -94,6 +106,9 @@ pub enum ResponseItem {
     FunctionCallOutput {
         call_id: String,
         output: FunctionCallOutputPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        thought_signature: Option<String>,
     },
     CustomToolCall {
         #[serde(default, skip_serializing)]
@@ -177,14 +192,25 @@ fn invalid_image_error_placeholder(
 impl From<ResponseInputItem> for ResponseItem {
     fn from(item: ResponseInputItem) -> Self {
         match item {
-            ResponseInputItem::Message { role, content } => Self::Message {
+            ResponseInputItem::Message {
+                role,
+                content,
+                thought_signature,
+            } => Self::Message {
                 role,
                 content,
                 id: None,
+                thought_signature,
             },
-            ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                Self::FunctionCallOutput { call_id, output }
-            }
+            ResponseInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                thought_signature,
+            } => Self::FunctionCallOutput {
+                call_id,
+                output,
+                thought_signature,
+            },
             ResponseInputItem::McpToolCallOutput { call_id, result } => {
                 let output = match result {
                     Ok(result) => FunctionCallOutputPayload::from(&result),
@@ -194,7 +220,11 @@ impl From<ResponseInputItem> for ResponseItem {
                         ..Default::default()
                     },
                 };
-                Self::FunctionCallOutput { call_id, output }
+                Self::FunctionCallOutput {
+                    call_id,
+                    output,
+                    thought_signature: None,
+                }
             }
             ResponseInputItem::CustomToolCallOutput { call_id, output } => {
                 Self::CustomToolCallOutput { call_id, output }
@@ -320,6 +350,7 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                     },
                 })
                 .collect::<Vec<ContentItem>>(),
+            thought_signature: None,
         }
     }
 }

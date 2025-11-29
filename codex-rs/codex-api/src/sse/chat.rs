@@ -229,6 +229,7 @@ pub async fn process_chat_sse<S>(
                         name: state.name.unwrap_or_default(),
                         arguments: state.arguments,
                         call_id: call_id.clone(),
+                        thought_signature: None,
                     };
                     let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }
@@ -247,6 +248,7 @@ async fn append_assistant_text(
             id: None,
             role: "assistant".to_string(),
             content: vec![],
+            thought_signature: None,
         };
         *assistant_item = Some(item.clone());
         let _ = tx_event
