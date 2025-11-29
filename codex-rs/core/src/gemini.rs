@@ -152,12 +152,14 @@ fn build_gemini_request(
             function_call: None,
             function_response: None,
             thought_signature: None,
+            thought: None,
         }],
     });
 
     Ok(GenerateContentRequest {
         contents,
         tools,
+        tool_config: None,
         generation_config,
         system_instruction,
     })
@@ -178,6 +180,7 @@ fn build_generation_config(
     let thinking_config = thinking_level.map(|level| ThinkingConfig {
         thinking_level: Some(level),
         thinking_budget: None,
+        include_thoughts: None,
     });
 
     if thinking_config.is_none() && response_mime_type.is_none() && response_json_schema.is_none() {
@@ -264,6 +267,7 @@ fn map_history_to_contents(items: &[ResponseItem]) -> Vec<Content> {
                     }),
                     function_response: None,
                     thought_signature: thought_signature.clone(),
+                    thought: None,
                 };
                 ("model".to_string(), vec![part])
             }
@@ -284,6 +288,7 @@ fn map_history_to_contents(items: &[ResponseItem]) -> Vec<Content> {
                         response: build_function_response_payload(output),
                     }),
                     thought_signature: None,
+                    thought: None,
                 };
                 ("user".to_string(), vec![part])
             }
@@ -295,6 +300,7 @@ fn map_history_to_contents(items: &[ResponseItem]) -> Vec<Content> {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    thought: None,
                 };
                 ("user".to_string(), vec![part])
             }
@@ -315,6 +321,7 @@ fn map_history_to_contents(items: &[ResponseItem]) -> Vec<Content> {
 
     contents
 }
+
 fn content_item_to_parts(item: &ContentItem) -> Vec<Part> {
     match item {
         ContentItem::InputText { text } | ContentItem::OutputText { text } => vec![Part {
@@ -324,6 +331,7 @@ fn content_item_to_parts(item: &ContentItem) -> Vec<Part> {
             function_call: None,
             function_response: None,
             thought_signature: None,
+            thought: None,
         }],
         ContentItem::InputImage { image_url } => {
             if let Some(blob) = inline_data_from_image_url(image_url) {
@@ -334,6 +342,7 @@ fn content_item_to_parts(item: &ContentItem) -> Vec<Part> {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    thought: None,
                 }]
             } else {
                 vec![Part {
@@ -343,6 +352,7 @@ fn content_item_to_parts(item: &ContentItem) -> Vec<Part> {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    thought: None,
                 }]
             }
         }
@@ -623,11 +633,16 @@ fn usage_from_metadata(meta: &UsageMetadata) -> Option<TokenUsage> {
     let input = meta.prompt_token_count?;
     let output = meta.candidates_token_count.unwrap_or(0);
     let total = meta.total_token_count.unwrap_or(input + output);
+    // Reasoning output tokens logic:
+    // If Gemini separates thought tokens in usage metadata, we should use it.
+    // 'thoughts_token_count' is in metadata.
+    let reasoning = meta.thoughts_token_count.unwrap_or(0);
+
     Some(TokenUsage {
         input_tokens: input,
         cached_input_tokens: 0,
         output_tokens: output,
-        reasoning_output_tokens: 0,
+        reasoning_output_tokens: reasoning,
         total_tokens: total,
     })
 }

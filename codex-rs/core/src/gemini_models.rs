@@ -4,11 +4,44 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateContentRequest {
     pub contents: Vec<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ToolConfig>,
     #[serde(rename = "generationConfig")]
     pub generation_config: Option<GenerationConfig>,
     #[serde(rename = "systemInstruction")]
     pub system_instruction: Option<Content>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolConfig {
+    #[serde(
+        rename = "functionCallingConfig",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub function_calling_config: Option<FunctionCallingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallingConfig {
+    #[serde(rename = "mode", skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FunctionCallingMode>,
+    #[serde(
+        rename = "allowedFunctionNames",
+        alias = "allowed_function_names",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_function_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FunctionCallingMode {
+    Auto,
+    Any,
+    None,
+    Validated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +70,9 @@ pub struct Part {
         skip_serializing_if = "Option::is_none"
     )]
     pub thought_signature: Option<String>,
+    // Gemini thinking process summary flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,8 +101,16 @@ pub struct FunctionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
-    #[serde(rename = "functionDeclarations", alias = "function_declarations")]
-    pub function_declarations: Vec<FunctionDeclaration>,
+    #[serde(
+        rename = "functionDeclarations",
+        alias = "function_declarations",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub function_declarations: Option<Vec<FunctionDeclaration>>,
+    #[serde(rename = "googleSearch", skip_serializing_if = "Option::is_none")]
+    pub google_search: Option<serde_json::Value>,
+    #[serde(rename = "codeExecution", skip_serializing_if = "Option::is_none")]
+    pub code_execution: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +158,12 @@ pub struct ThinkingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub thinking_budget: Option<i32>,
+    #[serde(
+        rename = "includeThoughts",
+        alias = "include_thoughts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_thoughts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +226,8 @@ pub struct UsageMetadata {
     pub candidates_token_count: Option<i64>,
     #[serde(rename = "totalTokenCount")]
     pub total_token_count: Option<i64>,
+    #[serde(rename = "thoughtsTokenCount")]
+    pub thoughts_token_count: Option<i64>,
 }
 
 /// Derive the canonical Gemini generateContent REST URL for a model slug.

@@ -27,11 +27,14 @@ By building a native adapter, we ensure correct handling of these nuances, resul
 ### Data Models (`core/src/gemini_models.rs`)
 - **Type-Safe Structs**: Comprehensive Rust structs representing the Gemini API schema (`GenerateContentRequest`, `Candidate`, `Part`, etc.).
 - **Reasoning Support**: Includes fields for `thought_signature` (Gemini 3.0+) and `thinking_config` (for reasoning models), allowing Codex to support "thinking" models natively.
+- **Thinking Process**: Supports `include_thoughts` in `ThinkingConfig` and `thought` flag in `Part` to retrieve thought summaries. Tracks `thoughts_token_count` in usage metadata.
+- **Advanced Tooling**: Supports `ToolConfig` for controlling function calling modes (`AUTO`, `ANY`, `NONE`, `VALIDATED`) and `allowed_function_names`. Also supports native Gemini tools like `googleSearch` and `codeExecution`.
 - **Token Usage**: Captures and reports `usageMetadata` for proper accounting.
 
 ### Tooling & Function Calling (`core/src/tools/spec.rs`)
 - **Schema Sanitization**: A dedicated `create_tools_json_for_gemini_api` helper strips OpenAI-specific fields (like `strict` and `additionalProperties`) from JSON schemas, as Gemini implements a stricter subset of JSON Schema.
 - **Tool Choice**: Automatically formats Codex `ToolSpec` into Gemini `function_declarations`.
+- **Structured Outputs**: Native support for `response_json_schema` in generation config, ensuring the model's output adheres to a strict JSON schema when requested.
 
 ### Thought Signatures & Reasoning
 - **Signatures**: For models that emit `thought_signature` (like Gemini 3.0 Pro), the adapter captures these opaque strings and ensures they are attached to the correct `FunctionCall` parts in subsequent requests.
