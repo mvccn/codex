@@ -124,11 +124,41 @@ impl ModelProviderInfo {
     ) -> crate::error::Result<CodexRequestBuilder> {
         let effective_auth = self.effective_auth(auth)?;
 
-        let url = self.get_full_url(&effective_auth);
+        let mut url = self.get_full_url(&effective_auth);
+
+        let mut gemini_api_key = None;
+        if self.wire_api == WireApi::Gemini {
+            if let Some(auth) = effective_auth.as_ref()
+                && auth.mode == AuthMode::ApiKey
+            {
+                let api_key = auth.get_token().await?;
+                if !api_key.is_empty() {
+                    gemini_api_key = Some(api_key);
+                }
+            } else if let Ok(api_key) = std::env::var("GEMINI_API_KEY")
+                && !api_key.trim().is_empty()
+            {
+                gemini_api_key = Some(api_key);
+            }
+        }
+
+        if self.wire_api == WireApi::Gemini
+            && let Some(api_key) = &gemini_api_key
+        {
+            if url.contains('?') {
+                url = format!("{url}&key={api_key}");
+            } else {
+                url = format!("{url}?key={api_key}");
+            }
+        }
 
         let mut builder = client.post(url);
 
-        if let Some(auth) = effective_auth.as_ref() {
+        if self.wire_api == WireApi::Gemini {
+            if let Some(api_key) = &gemini_api_key {
+                builder = builder.header("x-goog-api-key", api_key);
+            }
+        } else if let Some(auth) = effective_auth.as_ref() {
             builder = builder.bearer_auth(auth.get_token().await?);
         }
 
