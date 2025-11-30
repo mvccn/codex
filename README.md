@@ -1,112 +1,60 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
+# Codex (Gemini Edition)
 
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-</br>
-</br>If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE</a>
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a></p>
+This repository is a specialized fork of the Codex project, architected to provide a fully native, robust integration with Google's Gemini models.
 
-<p align="center">
-  <img src="./.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-  </p>
+## Project Origin & Philosophy
 
----
+While the original Codex is a powerful coding assistant, its architecture is heavily optimized for OpenAI-style APIs. Simply using a proxy to "translate" Gemini to OpenAI's format is insufficient for production-grade reliability.
 
-## Quickstart
+**Why a Simple OpenAI Proxy Won't Work:**
+Attempting to force Gemini into an OpenAI-shaped hole leads to significant issues:
+1.  **Stateful Thought Signatures**: Gemini 3.0+ models use opaque `thought_signature` tokens for reasoning. These must be preserved and threaded back into specific conversation slots. OpenAI proxies typically discard or mishandle these, breaking the reasoning chain.
+2.  **Strict Conversation Topology**: Gemini enforces a rigid `User -> Model -> User` flow and demands that parallel function calls be coalesced into single blocks. Proxies often fail to reshape history correctly, causing 400 Bad Request errors.
+3.  **Schema Divergence**: Gemini uses a stricter subset of JSON Schema. Passing OpenAI defaults (like `strict` or `additionalProperties`) causes API rejections.
+4.  **Native Features**: Features like `thinking_config` and `safety_settings` have no direct equivalent in the OpenAI API.
 
-### Installing and running Codex CLI
+**Our Philosophy:**
+We believe in a **native-first approach**. By building a dedicated adapter that speaks Gemini's native protocol (Google Generative Language API), we unlock the full capabilities of the model—including reliable reasoning, robust function calling, and multimodal inputs—without the translation loss of a proxy.
 
-Install globally with your preferred package manager. If you use npm:
+## Key Features
 
-```shell
-npm install -g @openai/codex
-```
+- **Native Gemini Adapter**: Built from the ground up to handle Gemini's unique API quirks and requirements.
+- **Multimodal Support**: Native support for **PDF and Image inputs**, allowing the model to reason about documents and visuals directly.
+- **Advanced Reasoning**: Full support for Gemini 3.0+ "thinking" models, including the handling of thought signatures and thinking configuration.
+- **Robust Function Calling**: Correctly handles parallel tool calls, history coalescing, and schema sanitization to ensure high reliability.
+- **Direct API Client**: A dedicated async client supporting both SSE (streaming) and standard JSON transports.
 
-Alternatively, if you use Homebrew:
+## Gemini Differences & Technical Implementation
 
-```shell
-brew install --cask codex
-```
+This project implements several key technical differentiators to support Gemini:
 
-Then simply run `codex` to get started:
+### 1. Stateful Thought Signatures
+Gemini 3.0+ models emit `thought_signature` tokens. Our adapter:
+- Captures these opaque strings during generation.
+- Threads them back into the *exact* correct location in the conversation history for subsequent turns.
+- Ensures they are never sent where prohibited (e.g., in user tool outputs), preventing API errors.
 
-```shell
-codex
-```
+### 2. Strict Conversation Topology
+Gemini is strict about turn structure. Our implementation:
+- **Coalesces History**: Merges adjacent messages of the same role (e.g., multiple function calls) into single `Content` blocks.
+- **Maps History**: Transforms Codex's linear history into Gemini's multi-part format dynamically.
 
-If you're running into upgrade issues with Homebrew, see the [FAQ entry on brew upgrade codex](./docs/faq.md#brew-upgrade-codex-isnt-upgrading-me).
+### 3. Schema Handling
+- **Sanitization**: Automatically strips OpenAI-specific fields (like `strict`) from JSON schemas before sending them to Gemini.
+- **Structured Outputs**: Supports `response_json_schema` for guaranteed output structure.
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+### 4. Native Tooling
+- Supports `ToolConfig` for fine-grained control (e.g., forcing a specific function).
+- Integration with native tools like `googleSearch` and `codeExecution`.
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+## Configuration & Usage
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+- **Provider**: Set `wire_api` to `Gemini`.
+- **Authentication**: Uses standard Google Generative Language API keys.
+- **Models**: Canonical URLs are auto-generated (e.g., `models/gemini-2.0-flash`).
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+## Testing
 
-</details>
-
-### Using Codex with your ChatGPT plan
-
-<p align="center">
-  <img src="./.github/codex-cli-login.png" alt="Codex CLI login" width="80%" />
-  </p>
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Team, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](./docs/authentication.md#usage-based-billing-alternative-use-an-openai-api-key). If you previously used an API key for usage-based billing, see the [migration steps](./docs/authentication.md#migrating-from-usage-based-billing-api-key). If you're having trouble with login, please comment on [this issue](https://github.com/openai/codex/issues/1243).
-
-### Model Context Protocol (MCP)
-
-Codex can access MCP servers. To configure them, refer to the [config docs](./docs/config.md#mcp_servers).
-
-### Configuration
-
-Codex CLI supports a rich set of configuration options, with preferences stored in `~/.codex/config.toml`. For full configuration options, see [Configuration](./docs/config.md).
-
-### Execpolicy
-
-See the [Execpolicy quickstart](./docs/execpolicy.md) to set up rules that govern what commands Codex can execute.
-
-### Docs & FAQ
-
-- [**Getting started**](./docs/getting-started.md)
-  - [CLI usage](./docs/getting-started.md#cli-usage)
-  - [Slash Commands](./docs/slash_commands.md)
-  - [Running with a prompt as input](./docs/getting-started.md#running-with-a-prompt-as-input)
-  - [Example prompts](./docs/getting-started.md#example-prompts)
-  - [Custom prompts](./docs/prompts.md)
-  - [Memory with AGENTS.md](./docs/getting-started.md#memory-with-agentsmd)
-- [**Configuration**](./docs/config.md)
-  - [Example config](./docs/example-config.md)
-- [**Sandbox & approvals**](./docs/sandbox.md)
-- [**Execpolicy quickstart**](./docs/execpolicy.md)
-- [**Authentication**](./docs/authentication.md)
-  - [Auth methods](./docs/authentication.md#forcing-a-specific-auth-method-advanced)
-  - [Login on a "Headless" machine](./docs/authentication.md#connecting-on-a-headless-machine)
-- **Automating Codex**
-  - [GitHub Action](https://github.com/openai/codex-action)
-  - [TypeScript SDK](./sdk/typescript/README.md)
-  - [Non-interactive mode (`codex exec`)](./docs/exec.md)
-- [**Advanced**](./docs/advanced.md)
-  - [Tracing / verbose logging](./docs/advanced.md#tracing--verbose-logging)
-  - [Model Context Protocol (MCP)](./docs/advanced.md#model-context-protocol-mcp)
-- [**Zero data retention (ZDR)**](./docs/zdr.md)
-- [**Contributing**](./docs/contributing.md)
-- [**Install & build**](./docs/install.md)
-  - [System Requirements](./docs/install.md#system-requirements)
-  - [DotSlash](./docs/install.md#dotslash)
-  - [Build from source](./docs/install.md#build-from-source)
-- [**FAQ**](./docs/faq.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
----
-
-## License
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+The project maintains a rigorous test suite to ensure stability:
+- **Integration Suite**: Wiremock-based tests cover streaming, function calling, and error handling.
+- **Live Smoke Tests**: Opt-in tests against the real Gemini API to verify end-to-end functionality (`RUN_LIVE_GEMINI=1`).
