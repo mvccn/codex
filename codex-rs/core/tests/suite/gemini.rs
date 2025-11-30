@@ -77,7 +77,7 @@ async fn build_gemini_client(
         Arc::clone(&config),
         None,
         otel_event_manager,
-        provider,
+        &provider,
         effort,
         summary,
         conversation_id,

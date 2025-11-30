@@ -132,7 +132,7 @@ pub(crate) async fn assess_command(
         Arc::clone(&config),
         Some(auth_manager),
         child_otel,
-        provider,
+        &provider,
         Some(SANDBOX_ASSESSMENT_REASONING_EFFORT),
         config.model_reasoning_summary,
         conversation_id,

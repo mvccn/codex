@@ -74,6 +74,7 @@ use crate::exec::StreamOutput;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
+use crate::model_provider_info::WireApi;
 use crate::openai_model_info::get_model_info;
 use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageContentDeltaEvent;
@@ -360,6 +361,22 @@ impl SessionConfiguration {
         let mut next_configuration = self.clone();
         if let Some(model) = updates.model.clone() {
             next_configuration.model = model;
+
+            // Heuristic to switch away from Gemini if the new model is clearly OpenAI.
+            if next_configuration.provider.wire_api == WireApi::Gemini
+                && updates.model_provider_id.is_none()
+                && (next_configuration.model.starts_with("gpt-")
+                    || next_configuration.model.starts_with("o1-"))
+            {
+                if let Some(provider) = self
+                    .original_config_do_not_use
+                    .model_providers
+                    .get("openai")
+                {
+                    next_configuration.provider_id = "openai".to_string();
+                    next_configuration.provider = provider.clone();
+                }
+            }
         }
         if let Some(provider_id) = updates.model_provider_id.clone() {
             if let Some(provider) = self
@@ -438,7 +455,7 @@ impl Session {
             Arc::new(per_turn_config.clone()),
             auth_manager,
             otel_event_manager,
-            provider,
+            &provider,
             session_configuration.model_reasoning_effort,
             session_configuration.model_reasoning_summary,
             conversation_id,

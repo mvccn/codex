@@ -9,3 +9,6 @@ The changelog can be found on the [releases page](https://github.com/openai/code
 - **Strict Topology**: Enforced strict conversation topology (User -> Model -> User) and message coalescing to prevent 400 Bad Request errors.
 - **Tooling**: Implemented strict JSON schema sanitization for tool definitions to match Gemini's requirements.
 - **Authentication**: Improved API key handling and authentication logic.
+
+### Refactor
+- **Driver Architecture**: Introduced a pluggable `ModelDriver` trait with dedicated OpenAI and Gemini implementations so providers can select their wire API without touching core call sites.

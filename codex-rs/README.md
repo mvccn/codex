@@ -48,6 +48,10 @@ Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.t
 
 You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS.
 
+### Model Drivers
+
+Codex now routes model traffic through a pluggable driver layer (`ModelDriver`). We ship an OpenAI-compatible driver (Responses/Chat) and a native Gemini driver; providers select the right implementation via their `wire_api` setting. This makes it straightforward to add additional providers without touching the call sites in core.
+
 ### `codex exec` to run Codex programmatically/non-interactively
 
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
