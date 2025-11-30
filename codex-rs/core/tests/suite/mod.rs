@@ -36,6 +36,7 @@ mod items;
 mod json_result;
 mod list_dir;
 mod live_cli;
+mod live_core;
 mod model_overrides;
 mod model_tools;
 mod otel;

@@ -275,15 +275,15 @@ pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApp
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
     if let [body] = argv
-        && parse_patch(body).is_ok()
-    {
-        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
-    }
+        && body.trim_start().starts_with(parser::BEGIN_PATCH_MARKER) && parse_patch(body).is_ok() {
+            return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
+        }
     if let Some((_, script)) = parse_shell_script(argv)
-        && parse_patch(script).is_ok()
-    {
-        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
-    }
+        && script.trim_start().starts_with(parser::BEGIN_PATCH_MARKER)
+            && parse_patch(script).is_ok()
+        {
+            return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
+        }
 
     match maybe_parse_apply_patch(argv) {
         MaybeApplyPatch::Body(ApplyPatchArgs {
@@ -800,11 +800,7 @@ fn compute_replacements(
             replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
             line_index = start_idx + pattern.len();
         } else {
-            return Err(ApplyPatchError::ComputeReplacements(format!(
-                "Failed to find expected lines in {}:\n{}",
-                path.display(),
-                chunk.old_lines.join("\n"),
-            )));
+            return Err(ApplyPatchError::ComputeReplacements(describe_mismatch(path, original_lines, pattern)));
         }
     }
 
@@ -839,6 +835,65 @@ fn apply_replacements(
     }
 
     lines
+}
+
+fn describe_mismatch(path: &Path, original_lines: &[String], pattern: &[String]) -> String {
+    let normalize = |s: &str| {
+        s.trim()
+            .chars()
+            .map(|c| match c {
+                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+                | '\u{2212}' => '-',
+                '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+                '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+                '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+                | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+                | '\u{3000}' => ' ',
+                other => other,
+            })
+            .collect::<String>()
+    };
+
+    let mut best_score: usize = 0;
+    let mut best_start: Option<usize> = None;
+    for start in 0..original_lines.len() {
+        let mut score = 0;
+        for (idx, pat) in pattern.iter().enumerate() {
+            let pos = start + idx;
+            if pos >= original_lines.len() {
+                break;
+            }
+            if normalize(&original_lines[pos]) == normalize(pat) {
+                score += 1;
+            } else {
+                break;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_start = Some(start);
+        }
+    }
+
+    let header = format!("Failed to find expected lines in {}", path.display());
+    if best_score == 0 || best_start.is_none() {
+        return format!("{header}:\n{}", pattern.join("\n"));
+    }
+
+    let start = best_start.expect("best_start set when best_score > 0");
+    let next_expected = pattern
+        .get(best_score)
+        .map(String::as_str)
+        .unwrap_or("<end of pattern>");
+    let next_actual = original_lines
+        .get(start + best_score)
+        .map(String::as_str)
+        .unwrap_or("<end of file>");
+    format!(
+        "{header}: matched {best_score}/{} lines near line {} (expected: '{next_expected}', file has: '{next_actual}')",
+        pattern.len(),
+        start + 1
+    )
 }
 
 /// Intended result of a file update for apply_patch.

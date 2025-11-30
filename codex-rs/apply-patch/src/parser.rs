@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
+pub const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
 const END_PATCH_MARKER: &str = "*** End Patch";
 const ADD_FILE_MARKER: &str = "*** Add File: ";
 const DELETE_FILE_MARKER: &str = "*** Delete File: ";
@@ -37,6 +37,7 @@ const MOVE_TO_MARKER: &str = "*** Move to: ";
 const EOF_MARKER: &str = "*** End of File";
 const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
+const MARKDOWN_FENCE: &str = "```";
 
 /// Currently, the only OpenAI model that knowingly requires lenient parsing is
 /// gpt-4.1. While we could try to require everyone to pass in a strictness
@@ -112,6 +113,7 @@ pub fn parse_patch(patch: &str) -> Result<ApplyPatchArgs, ParseError> {
     parse_patch_text(patch, mode)
 }
 
+#[derive(Clone, Copy)]
 enum ParseMode {
     /// Parse the patch text argument as is.
     Strict,
@@ -152,19 +154,12 @@ enum ParseMode {
 }
 
 fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, ParseError> {
-    let lines: Vec<&str> = patch.trim().lines().collect();
-    let lines: &[&str] = match check_patch_boundaries_strict(&lines) {
-        Ok(()) => &lines,
-        Err(e) => match mode {
-            ParseMode::Strict => {
-                return Err(e);
-            }
-            ParseMode::Lenient => check_patch_boundaries_lenient(&lines, e)?,
-        },
-    };
+    let normalized_patch = normalize_patch_input(patch, mode)?;
+    let lines: Vec<&str> = normalized_patch.lines().collect();
 
     let mut hunks: Vec<Hunk> = Vec::new();
-    // The above checks ensure that lines.len() >= 2.
+    // The normalization ensures that lines.len() >= 2 and that the first and
+    // last lines are the expected patch markers.
     let last_line_index = lines.len().saturating_sub(1);
     let mut remaining_lines = &lines[1..last_line_index];
     let mut line_number = 2;
@@ -182,62 +177,64 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
     })
 }
 
-/// Checks the start and end lines of the patch text for `apply_patch`,
-/// returning an error if they do not match the expected markers.
-fn check_patch_boundaries_strict(lines: &[&str]) -> Result<(), ParseError> {
-    let (first_line, last_line) = match lines {
-        [] => (None, None),
-        [first] => (Some(first), Some(first)),
-        [first, .., last] => (Some(first), Some(last)),
-    };
-    check_start_and_end_lines_strict(first_line, last_line)
-}
+fn normalize_patch_input(patch: &str, mode: ParseMode) -> Result<String, ParseError> {
+    let mut lines: Vec<String> = patch
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect();
 
-/// If we are in lenient mode, we check if the first line starts with `<<EOF`
-/// (possibly quoted) and the last line ends with `EOF`. There must be at least
-/// 4 lines total because the heredoc markers take up 2 lines and the patch text
-/// must have at least 2 lines.
-///
-/// If successful, returns the lines of the patch text that contain the patch
-/// contents, excluding the heredoc markers.
-fn check_patch_boundaries_lenient<'a>(
-    original_lines: &'a [&'a str],
-    original_parse_error: ParseError,
-) -> Result<&'a [&'a str], ParseError> {
-    match original_lines {
-        [first, .., last] => {
-            if (first == &"<<EOF" || first == &"<<'EOF'" || first == &"<<\"EOF\"")
-                && last.ends_with("EOF")
-                && original_lines.len() >= 4
+    trim_empty_edges(&mut lines);
+    strip_heredoc_wrapper(&mut lines);
+    strip_markdown_fence(&mut lines);
+    trim_empty_edges(&mut lines);
+
+    match mode {
+        ParseMode::Strict => {}
+        ParseMode::Lenient => {
+            if let Some(start_idx) = lines
+                .iter()
+                .position(|line| line.trim().eq_ignore_ascii_case(BEGIN_PATCH_MARKER))
             {
-                let inner_lines = &original_lines[1..original_lines.len() - 1];
-                match check_patch_boundaries_strict(inner_lines) {
-                    Ok(()) => Ok(inner_lines),
-                    Err(e) => Err(e),
-                }
-            } else {
-                Err(original_parse_error)
+                lines.drain(0..start_idx);
             }
         }
-        _ => Err(original_parse_error),
     }
-}
 
-fn check_start_and_end_lines_strict(
-    first_line: Option<&&str>,
-    last_line: Option<&&str>,
-) -> Result<(), ParseError> {
-    match (first_line, last_line) {
-        (Some(&first), Some(&last)) if first == BEGIN_PATCH_MARKER && last == END_PATCH_MARKER => {
-            Ok(())
-        }
-        (Some(&first), _) if first != BEGIN_PATCH_MARKER => Err(InvalidPatchError(String::from(
-            "The first line of the patch must be '*** Begin Patch'",
-        ))),
-        _ => Err(InvalidPatchError(String::from(
-            "The last line of the patch must be '*** End Patch'",
-        ))),
+    if lines
+        .first()
+        .map(|line| line.trim().eq_ignore_ascii_case(BEGIN_PATCH_MARKER))
+        != Some(true)
+    {
+        return Err(InvalidPatchError(
+            "The first line of the patch must be '*** Begin Patch'".to_string(),
+        ));
     }
+
+    if let Some(first) = lines.first_mut()
+        && first.trim() != BEGIN_PATCH_MARKER {
+            *first = BEGIN_PATCH_MARKER.to_string();
+        }
+
+    match lines
+        .iter()
+        .rposition(|line| line.trim().eq_ignore_ascii_case(END_PATCH_MARKER))
+    {
+        Some(end_idx) => {
+            lines.truncate(end_idx + 1);
+        }
+        None => {
+            return Err(InvalidPatchError(
+                "The last line of the patch must be '*** End Patch'".to_string(),
+            ));
+        }
+    }
+
+    if let Some(last) = lines.last_mut()
+        && last.trim() != END_PATCH_MARKER {
+            *last = END_PATCH_MARKER.to_string();
+        }
+
+    Ok(lines.join("\n"))
 }
 
 /// Attempts to parse a single hunk from the start of lines.
@@ -245,7 +242,7 @@ fn check_start_and_end_lines_strict(
 fn parse_one_hunk(lines: &[&str], line_number: usize) -> Result<(Hunk, usize), ParseError> {
     // Be tolerant of case mismatches and extra padding around marker strings.
     let first_line = lines[0].trim();
-    if let Some(path) = first_line.strip_prefix(ADD_FILE_MARKER) {
+    if let Some(path) = strip_prefix_case_insensitive(first_line, ADD_FILE_MARKER) {
         // Add File
         let mut contents = String::new();
         let mut parsed_lines = 1;
@@ -265,7 +262,7 @@ fn parse_one_hunk(lines: &[&str], line_number: usize) -> Result<(Hunk, usize), P
             },
             parsed_lines,
         ));
-    } else if let Some(path) = first_line.strip_prefix(DELETE_FILE_MARKER) {
+    } else if let Some(path) = strip_prefix_case_insensitive(first_line, DELETE_FILE_MARKER) {
         // Delete File
         return Ok((
             DeleteFile {
@@ -273,7 +270,7 @@ fn parse_one_hunk(lines: &[&str], line_number: usize) -> Result<(Hunk, usize), P
             },
             1,
         ));
-    } else if let Some(path) = first_line.strip_prefix(UPDATE_FILE_MARKER) {
+    } else if let Some(path) = strip_prefix_case_insensitive(first_line, UPDATE_FILE_MARKER) {
         // Update File
         let mut remaining_lines = &lines[1..];
         let mut parsed_lines = 1;
@@ -281,7 +278,7 @@ fn parse_one_hunk(lines: &[&str], line_number: usize) -> Result<(Hunk, usize), P
         // Optional: move file line
         let move_path = remaining_lines
             .first()
-            .and_then(|x| x.strip_prefix(MOVE_TO_MARKER));
+            .and_then(|x| strip_prefix_case_insensitive(x, MOVE_TO_MARKER));
 
         if move_path.is_some() {
             remaining_lines = &remaining_lines[1..];
@@ -348,12 +345,36 @@ fn parse_update_file_chunk(
             line_number,
         });
     }
-    // If we see an explicit context marker @@ or @@ <context>, consume it; otherwise, optionally
-    // allow treating the chunk as starting directly with diff lines.
-    let (change_context, start_index) = if lines[0] == EMPTY_CHANGE_CONTEXT_MARKER {
-        (None, 1)
-    } else if let Some(context) = lines[0].strip_prefix(CHANGE_CONTEXT_MARKER) {
-        (Some(context.to_string()), 1)
+
+    let mut change_context = String::new();
+    let mut start_index = 0;
+
+    // Consume all contiguous @@ lines at the start
+    loop {
+        if start_index >= lines.len() {
+            break;
+        }
+        let line = lines[start_index];
+
+        if line.eq_ignore_ascii_case(EMPTY_CHANGE_CONTEXT_MARKER) {
+            start_index += 1;
+        } else if let Some(context) = strip_prefix_case_insensitive(line, CHANGE_CONTEXT_MARKER) {
+            if !change_context.is_empty() {
+                change_context.push('\n');
+            }
+            change_context.push_str(context);
+            start_index += 1;
+        } else {
+            break;
+        }
+    }
+
+    let change_context = if start_index > 0 {
+        if change_context.is_empty() {
+            None
+        } else {
+            Some(change_context)
+        }
     } else {
         if !allow_missing_context {
             return Err(InvalidHunkError {
@@ -364,14 +385,16 @@ fn parse_update_file_chunk(
                 line_number,
             });
         }
-        (None, 0)
+        None
     };
+
     if start_index >= lines.len() {
         return Err(InvalidHunkError {
             message: "Update hunk does not contain any lines".to_string(),
-            line_number: line_number + 1,
+            line_number: line_number + start_index,
         });
     }
+
     let mut chunk = UpdateFileChunk {
         change_context,
         old_lines: Vec::new(),
@@ -381,11 +404,11 @@ fn parse_update_file_chunk(
     let mut parsed_lines = 0;
     for line in &lines[start_index..] {
         match *line {
-            EOF_MARKER => {
+            EOF_MARKER if line.trim() == EOF_MARKER => {
                 if parsed_lines == 0 {
                     return Err(InvalidHunkError {
                         message: "Update hunk does not contain any lines".to_string(),
-                        line_number: line_number + 1,
+                        line_number: line_number + start_index + parsed_lines,
                     });
                 }
                 chunk.is_end_of_file = true;
@@ -415,7 +438,7 @@ fn parse_update_file_chunk(
                                 message: format!(
                                     "Unexpected line found in update hunk: '{line_contents}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"
                                 ),
-                                line_number: line_number + 1,
+                                line_number: line_number + start_index + parsed_lines,
                             });
                         }
                         // Assume this is the start of the next hunk.
@@ -428,6 +451,45 @@ fn parse_update_file_chunk(
     }
 
     Ok((chunk, parsed_lines + start_index))
+}
+
+fn strip_prefix_case_insensitive<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    input
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &input[prefix.len()..])
+}
+
+fn trim_empty_edges(lines: &mut Vec<String>) {
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+}
+
+fn strip_markdown_fence(lines: &mut Vec<String>) {
+    if lines
+        .first()
+        .is_some_and(|line| line.trim_start().starts_with(MARKDOWN_FENCE))
+        && lines
+            .last()
+            .is_some_and(|line| line.trim_start().starts_with(MARKDOWN_FENCE))
+    {
+        lines.pop();
+        lines.remove(0);
+    }
+}
+
+fn strip_heredoc_wrapper(lines: &mut Vec<String>) {
+    if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+        let first_trimmed = first.trim();
+        if first_trimmed.starts_with("<<") && last.trim_end().ends_with("EOF") && lines.len() >= 4 {
+            lines.pop();
+            lines.remove(0);
+        }
+    }
 }
 
 #[test]
@@ -578,13 +640,15 @@ fn test_parse_patch_lenient() {
             is_end_of_file: false,
         }],
     }];
-    let expected_error =
-        InvalidPatchError("The first line of the patch must be '*** Begin Patch'".to_string());
 
     let patch_text_in_heredoc = format!("<<EOF\n{patch_text}\nEOF\n");
     assert_eq!(
         parse_patch_text(&patch_text_in_heredoc, ParseMode::Strict),
-        Err(expected_error.clone())
+        Ok(ApplyPatchArgs {
+            hunks: expected_patch.clone(),
+            patch: patch_text.to_string(),
+            workdir: None,
+        })
     );
     assert_eq!(
         parse_patch_text(&patch_text_in_heredoc, ParseMode::Lenient),
@@ -598,7 +662,11 @@ fn test_parse_patch_lenient() {
     let patch_text_in_single_quoted_heredoc = format!("<<'EOF'\n{patch_text}\nEOF\n");
     assert_eq!(
         parse_patch_text(&patch_text_in_single_quoted_heredoc, ParseMode::Strict),
-        Err(expected_error.clone())
+        Ok(ApplyPatchArgs {
+            hunks: expected_patch.clone(),
+            patch: patch_text.to_string(),
+            workdir: None,
+        })
     );
     assert_eq!(
         parse_patch_text(&patch_text_in_single_quoted_heredoc, ParseMode::Lenient),
@@ -612,12 +680,16 @@ fn test_parse_patch_lenient() {
     let patch_text_in_double_quoted_heredoc = format!("<<\"EOF\"\n{patch_text}\nEOF\n");
     assert_eq!(
         parse_patch_text(&patch_text_in_double_quoted_heredoc, ParseMode::Strict),
-        Err(expected_error.clone())
+        Ok(ApplyPatchArgs {
+            hunks: expected_patch.clone(),
+            patch: patch_text.to_string(),
+            workdir: None,
+        })
     );
     assert_eq!(
         parse_patch_text(&patch_text_in_double_quoted_heredoc, ParseMode::Lenient),
         Ok(ApplyPatchArgs {
-            hunks: expected_patch,
+            hunks: expected_patch.clone(),
             patch: patch_text.to_string(),
             workdir: None,
         })
@@ -626,18 +698,28 @@ fn test_parse_patch_lenient() {
     let patch_text_in_mismatched_quotes_heredoc = format!("<<\"EOF'\n{patch_text}\nEOF\n");
     assert_eq!(
         parse_patch_text(&patch_text_in_mismatched_quotes_heredoc, ParseMode::Strict),
-        Err(expected_error.clone())
+        Ok(ApplyPatchArgs {
+            hunks: expected_patch.clone(),
+            patch: patch_text.to_string(),
+            workdir: None,
+        })
     );
     assert_eq!(
         parse_patch_text(&patch_text_in_mismatched_quotes_heredoc, ParseMode::Lenient),
-        Err(expected_error.clone())
+        Ok(ApplyPatchArgs {
+            hunks: expected_patch,
+            patch: patch_text.to_string(),
+            workdir: None,
+        })
     );
 
     let patch_text_with_missing_closing_heredoc =
         "<<EOF\n*** Begin Patch\n*** Update File: file2.py\nEOF\n".to_string();
     assert_eq!(
         parse_patch_text(&patch_text_with_missing_closing_heredoc, ParseMode::Strict),
-        Err(expected_error)
+        Err(InvalidPatchError(
+            "The last line of the patch must be '*** End Patch'".to_string()
+        ))
     );
     assert_eq!(
         parse_patch_text(&patch_text_with_missing_closing_heredoc, ParseMode::Lenient),
@@ -737,5 +819,16 @@ fn test_update_file_chunk() {
             }),
             3
         ))
+    );
+}
+
+#[test]
+fn test_multiple_at_context() {
+    let patch = "*** Begin Patch\n*** Update File: file.py\n@@ class BaseClass\n@@ def method():\n context\n-old\n+new\n*** End Patch";
+    let result = parse_patch_text(patch, ParseMode::Strict);
+    assert!(
+        result.is_ok(),
+        "Failed to parse multiple @@ context lines: {:?}",
+        result.err()
     );
 }

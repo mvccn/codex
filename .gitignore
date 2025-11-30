@@ -85,3 +85,11 @@ CHANGELOG.ignore.md
 # nix related
 .direnv
 .envrc
+.orig
+.rs.orig
+.rs.rej
+codex-rs/backend-client/src/client.rs.orig
+codex-rs/protocol/src/protocol.rs.orig
+codex-rs/protocol/src/protocol.rs.rej
+codex-rs/tui/src/status/rate_limits.rs.orig
+README.md.orig

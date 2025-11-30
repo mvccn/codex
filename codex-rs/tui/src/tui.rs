@@ -128,13 +128,14 @@ pub fn restore() -> Result<()> {
 
 /// Initialize the terminal (inline viewport; history stays in normal scrollback)
 pub fn init() -> Result<Terminal> {
-    if !stdin().is_terminal() {
-        return Err(std::io::Error::other("stdin is not a terminal"));
+    // Only check TTY and set raw mode if we are actually connected to a terminal.
+    // If not, we allow running (e.g. for piped tests) but standard crossterm
+    // backend might behave differently or just write escape codes to the pipe.
+    if stdin().is_terminal() && stdout().is_terminal() {
+        set_modes()?;
+    } else {
+        // Warn or log? For now, just proceed so tests can capture output.
     }
-    if !stdout().is_terminal() {
-        return Err(std::io::Error::other("stdout is not a terminal"));
-    }
-    set_modes()?;
 
     set_panic_hook();
 
