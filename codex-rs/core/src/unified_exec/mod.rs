@@ -73,6 +73,7 @@ pub(crate) struct ExecCommandRequest {
     pub workdir: Option<PathBuf>,
     pub with_escalated_permissions: Option<bool>,
     pub justification: Option<String>,
+    pub extra_env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -138,6 +139,9 @@ mod tests {
     use crate::codex::make_session_and_context;
     use crate::protocol::AskForApproval;
     use crate::protocol::SandboxPolicy;
+    use crate::tools::spec::ToolsConfig;
+    use crate::tools::spec::ToolsConfigParams;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use crate::unified_exec::ExecCommandRequest;
     use crate::unified_exec::WriteStdinRequest;
     use core_test_support::skip_if_sandbox;
@@ -145,6 +149,15 @@ mod tests {
     use tokio::time::Duration;
 
     use super::session::OutputBufferState;
+
+    fn test_dispatcher() -> Arc<crate::tools::ToolRouter> {
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &crate::model_family::find_family_for_model("gpt-5.1-codex")
+                .expect("test model"),
+            features: &crate::features::Features::with_defaults(),
+        });
+        Arc::new(crate::tools::ToolRouter::from_config(&config, None))
+    }
 
     fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
         let (session, mut turn) = make_session_and_context();
@@ -161,6 +174,8 @@ mod tests {
     ) -> Result<UnifiedExecResponse, UnifiedExecError> {
         let context =
             UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let dispatcher = test_dispatcher();
         let process_id = session
             .services
             .unified_exec_manager
@@ -179,8 +194,11 @@ mod tests {
                     workdir: None,
                     with_escalated_permissions: None,
                     justification: None,
+                    extra_env: None,
                 },
                 &context,
+                &tracker,
+                dispatcher,
             )
             .await
     }
@@ -191,16 +209,26 @@ mod tests {
         input: &str,
         yield_time_ms: u64,
     ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+        let turn = test_session_and_turn().1;
+        let context =
+            UnifiedExecContext::new(Arc::clone(session), Arc::clone(&turn), "call".to_string());
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let dispatcher = test_dispatcher();
         session
             .services
             .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
-                call_id: "write-stdin",
-                process_id,
-                input,
-                yield_time_ms,
-                max_output_tokens: None,
-            })
+            .write_stdin(
+                WriteStdinRequest {
+                    call_id: "write-stdin",
+                    process_id,
+                    input,
+                    yield_time_ms,
+                    max_output_tokens: None,
+                },
+                &context,
+                &tracker,
+                dispatcher,
+            )
             .await
     }
 

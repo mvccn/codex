@@ -21,6 +21,10 @@ use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandSource;
 use crate::sandboxing::ExecEnv;
 use crate::sandboxing::SandboxPermissions;
+use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolDispatcher;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
@@ -32,6 +36,9 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::formatted_truncate_text;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
+use serde_json::Value;
 
 use super::ExecCommandRequest;
 use super::MAX_UNIFIED_EXEC_SESSIONS;
@@ -102,7 +109,6 @@ impl UnifiedExecSessionManager {
             if store.contains(&process_id) {
                 continue;
             }
-
             store.insert(process_id.clone());
             return process_id;
         }
@@ -112,6 +118,8 @@ impl UnifiedExecSessionManager {
         &self,
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
+        tracker: &SharedTurnDiffTracker,
+        dispatcher: Arc<dyn ToolDispatcher>,
     ) -> Result<UnifiedExecResponse, UnifiedExecError> {
         let cwd = request
             .workdir
@@ -125,6 +133,7 @@ impl UnifiedExecSessionManager {
                 request.with_escalated_permissions,
                 request.justification,
                 context,
+                request.extra_env,
             )
             .await?;
 
@@ -138,11 +147,15 @@ impl UnifiedExecSessionManager {
             cancellation_token,
         } = session.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let (collected, exit_signaled) = Self::collect_output_until_deadline(
+        let writer_tx = session.writer_sender();
+        let (collected, exit_signaled) = Self::interact_until_deadline(
             &output_buffer,
             &output_notify,
             &cancellation_token,
             deadline,
+            Some(dispatcher),
+            Some(&writer_tx),
+            Some((context, tracker)),
         )
         .await;
         let mut has_exited = session.has_exited();
@@ -211,6 +224,9 @@ impl UnifiedExecSessionManager {
     pub(crate) async fn write_stdin(
         &self,
         request: WriteStdinRequest<'_>,
+        context: &UnifiedExecContext,
+        tracker: &SharedTurnDiffTracker,
+        dispatcher: Arc<dyn ToolDispatcher>,
     ) -> Result<UnifiedExecResponse, UnifiedExecError> {
         let process_id = request.process_id.to_string();
 
@@ -264,11 +280,14 @@ impl UnifiedExecSessionManager {
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let (collected, exit_signaled) = Self::collect_output_until_deadline(
+        let (collected, exit_signaled) = Self::interact_until_deadline(
             &output_buffer,
             &output_notify,
             &cancellation_token,
             deadline,
+            Some(dispatcher),
+            Some(&writer_tx),
+            Some((context, tracker)),
         )
         .await;
         if exit_signaled {
@@ -540,8 +559,14 @@ impl UnifiedExecSessionManager {
         with_escalated_permissions: Option<bool>,
         justification: Option<String>,
         context: &UnifiedExecContext,
+        extra_env: Option<HashMap<String, String>>,
     ) -> Result<UnifiedExecSession, UnifiedExecError> {
-        let env = apply_unified_exec_env(create_env(&context.turn.shell_environment_policy));
+        let mut env = apply_unified_exec_env(create_env(&context.turn.shell_environment_policy));
+        if let Some(extra) = extra_env {
+            for (k, v) in extra {
+                env.insert(k, v);
+            }
+        }
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = UnifiedExecRuntime::new(self);
         let req = UnifiedExecToolRequest::new(
@@ -576,18 +601,25 @@ impl UnifiedExecSessionManager {
             .map_err(|e| UnifiedExecError::create_session(format!("{e:?}")))
     }
 
-    /// Collect output until `deadline`, returning the buffered bytes and whether an exit signal
-    /// arrived during the wait.
-    pub(super) async fn collect_output_until_deadline(
+    pub(super) async fn interact_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
         deadline: Instant,
+        dispatcher: Option<Arc<dyn ToolDispatcher>>,
+        writer_tx: Option<&mpsc::Sender<Vec<u8>>>,
+        context: Option<(&UnifiedExecContext, &SharedTurnDiffTracker)>,
     ) -> (Vec<u8>, bool) {
         const POST_EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(25);
+        const TOOL_CALL_START: &str = "<<TOOL_CALL>>";
+        const TOOL_CALL_END: &str = "<<END_TOOL_CALL>>";
+        const MAX_TOOL_CALL_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10 MiB limit
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
+        let mut ipc_buffer = String::new();
+        let mut pending_utf8_bytes = Vec::new();
         let mut exit_signal_received = cancellation_token.is_cancelled();
+
         loop {
             let drained_chunks;
             let mut wait_for_output = None;
@@ -599,44 +631,147 @@ impl UnifiedExecSessionManager {
                 }
             }
 
-            if drained_chunks.is_empty() {
-                exit_signal_received |= cancellation_token.is_cancelled();
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining == Duration::ZERO {
-                    break;
-                }
-
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                if exit_signal_received {
-                    let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
-                    if tokio::time::timeout(grace, notified).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-
-                tokio::pin!(notified);
-                let exit_notified = cancellation_token.cancelled();
-                tokio::pin!(exit_notified);
-                tokio::select! {
-                    _ = &mut notified => {}
-                    _ = &mut exit_notified => exit_signal_received = true,
-                    _ = tokio::time::sleep(remaining) => break,
-                }
-                continue;
-            }
-
             for chunk in drained_chunks {
                 collected.extend_from_slice(&chunk);
+                if dispatcher.is_some() {
+                    pending_utf8_bytes.extend_from_slice(&chunk);
+                    loop {
+                        match std::str::from_utf8(&pending_utf8_bytes) {
+                            Ok(s) => {
+                                ipc_buffer.push_str(s);
+                                pending_utf8_bytes.clear();
+                                break;
+                            }
+                            Err(e) => {
+                                let valid_len = e.valid_up_to();
+                                if valid_len > 0 {
+                                    let s = unsafe { std::str::from_utf8_unchecked(&pending_utf8_bytes[..valid_len]) };
+                                    ipc_buffer.push_str(s);
+                                    pending_utf8_bytes.drain(..valid_len);
+                                    continue;
+                                }
+                                if let Some(invalid_len) = e.error_len() {
+                                    let s = String::from_utf8_lossy(&pending_utf8_bytes[..invalid_len]);
+                                    ipc_buffer.push_str(&s);
+                                    pending_utf8_bytes.drain(..invalid_len);
+                                    continue;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            exit_signal_received |= cancellation_token.is_cancelled();
-            if Instant::now() >= deadline {
-                break;
+            if let (Some(dispatcher), Some(writer_tx), Some((ctx, tracker))) =
+                (&dispatcher, writer_tx, context)
+            {
+                while let Some(start_idx) = ipc_buffer.find(TOOL_CALL_START) {
+                    if let Some(end_idx_rel) = ipc_buffer[start_idx..].find(TOOL_CALL_END) {
+                        let end_idx = start_idx + end_idx_rel;
+                        let json_start = start_idx + TOOL_CALL_START.len();
+                        let json_str = &ipc_buffer[json_start..end_idx];
+
+                        #[derive(serde::Deserialize)]
+                        struct ToolCallReq {
+                            name: String,
+                            args: Value,
+                        }
+
+                        let result_str = match serde_json::from_str::<ToolCallReq>(json_str) {
+                            Ok(req) => {
+                                let args_str = if req.args.is_string() {
+                                    req.args.as_str().unwrap().to_string()
+                                } else {
+                                    req.args.to_string()
+                                };
+
+                                let invocation = ToolInvocation {
+                                    session: Arc::clone(&ctx.session),
+                                    turn: Arc::clone(&ctx.turn),
+                                    tracker: Arc::clone(tracker),
+                                    call_id: ctx.call_id.clone(),
+                                    tool_name: req.name,
+                                    payload: ToolPayload::Function {
+                                        arguments: args_str,
+                                    },
+                                    dispatcher: Arc::clone(dispatcher),
+                                };
+
+                                match dispatcher.dispatch(invocation).await {
+                                    Ok(response) => match response {
+                                        ResponseInputItem::FunctionCallOutput {
+                                            output, ..
+                                        } => serde_json::to_string(&output).unwrap_or_default(),
+                                        _ => "{}".to_string(),
+                                    },
+                                    Err(e) => {
+                                        let output = FunctionCallOutputPayload {
+                                            content: e.to_string(),
+                                            success: Some(false),
+                                            ..Default::default()
+                                        };
+                                        serde_json::to_string(&output).unwrap_or_default()
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let output = FunctionCallOutputPayload {
+                                    content: format!("Failed to parse tool call: {e}"),
+                                    success: Some(false),
+                                    ..Default::default()
+                                };
+                                serde_json::to_string(&output).unwrap_or_default()
+                            }
+                        };
+
+                        // Escape `<<` to `\u003c\u003c` to prevent injection of the delimiter.
+                        let safe_result_str = result_str.replace("<<", "\\u003c\\u003c");
+                        let response_msg =
+                            format!("<<TOOL_RESULT>>{safe_result_str}<<END_TOOL_RESULT>>\n");
+                        let _ = Self::send_input(writer_tx, response_msg.as_bytes()).await;
+
+                        ipc_buffer.replace_range(start_idx..end_idx + TOOL_CALL_END.len(), "");
+                    } else {
+                        break;
+                    }
+                }
+
+                if ipc_buffer.len() > MAX_TOOL_CALL_BUFFER_SIZE {
+                    // Buffer is too large, drop everything to prevent OOM
+                    tracing::warn!("Tool call buffer exceeded limit, clearing");
+                    ipc_buffer.clear();
+                } else if ipc_buffer.len() > 100_000 {
+                    if let Some(idx) = ipc_buffer.find(TOOL_CALL_START) {
+                        if idx > 0 {
+                            ipc_buffer.drain(..idx);
+                        }
+                    } else {
+                        let keep = TOOL_CALL_START.len();
+                        if ipc_buffer.len() > keep {
+                            ipc_buffer.drain(..(ipc_buffer.len() - keep));
+                        }
+                    }
+                }
+            }
+
+            if let Some(notify_fut) = wait_for_output {
+                if exit_signal_received {
+                    match tokio::time::timeout(POST_EXIT_OUTPUT_GRACE, notify_fut).await {
+                        Ok(_) => continue,
+                        Err(_) => return (collected, true),
+                    }
+                }
+
+                if tokio::time::timeout_at(deadline, notify_fut).await.is_err() {
+                    return (collected, exit_signal_received);
+                }
+            }
+            if cancellation_token.is_cancelled() {
+                exit_signal_received = true;
             }
         }
-
-        (collected, exit_signal_received)
     }
 
     fn prune_sessions_if_needed(sessions: &mut HashMap<String, SessionEntry>) {

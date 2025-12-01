@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use crate::function_tool::FunctionCallError;
@@ -106,6 +109,8 @@ impl ToolHandler for UnifiedExecHandler {
             call_id,
             tool_name,
             payload,
+            tracker,
+            dispatcher,
             ..
         } = invocation;
 
@@ -158,7 +163,7 @@ impl ToolHandler for UnifiedExecHandler {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from);
                 let cwd = workdir.clone().unwrap_or_else(|| context.turn.cwd.clone());
-
+                let tools_env = setup_codex_tools_env(&dispatcher.specs());
                 let event_ctx = ToolEventCtx::new(
                     context.session.as_ref(),
                     context.turn.as_ref(),
@@ -184,8 +189,11 @@ impl ToolHandler for UnifiedExecHandler {
                             workdir,
                             with_escalated_permissions,
                             justification,
+                        extra_env: Some(tools_env),
                         },
                         &context,
+                        &tracker,
+                        dispatcher.clone(),
                     )
                     .await
                     .map_err(|err| {
@@ -199,13 +207,18 @@ impl ToolHandler for UnifiedExecHandler {
                     ))
                 })?;
                 manager
-                    .write_stdin(WriteStdinRequest {
-                        call_id: &call_id,
-                        process_id: &args.session_id.to_string(),
-                        input: &args.chars,
-                        yield_time_ms: args.yield_time_ms,
-                        max_output_tokens: args.max_output_tokens,
-                    })
+                    .write_stdin(
+                        WriteStdinRequest {
+                            call_id: &call_id,
+                            process_id: &args.session_id.to_string(),
+                            input: &args.chars,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                        },
+                        &context,
+                        &tracker,
+                        dispatcher.clone(),
+                    )
                     .await
                     .map_err(|err| {
                         FunctionCallError::RespondToModel(format!("write_stdin failed: {err:?}"))
@@ -272,4 +285,55 @@ fn format_response(response: &UnifiedExecResponse) -> String {
     sections.push(response.output.clone());
 
     sections.join("\n")
+}
+
+
+fn setup_codex_tools_env(specs: &[crate::client_common::tools::ToolSpec]) -> HashMap<String, String> {
+    let code = generate_python_tools(specs);
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    let hash = hasher.finish();
+    
+    let temp_dir = std::env::temp_dir().join(format!("codex_tools_{:x}", hash));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        tracing::warn!("Failed to create codex tools temp dir: {}", e);
+        return HashMap::new();
+    }
+    
+    let path = temp_dir.join("codex_tools.py");
+    if !path.exists() {
+        if let Err(e) = std::fs::write(&path, code) {
+             tracing::warn!("Failed to write codex_tools.py: {}", e);
+             return HashMap::new();
+        }
+    }
+    
+    let mut env = HashMap::new();
+    env.insert("PYTHONPATH".to_string(), temp_dir.to_string_lossy().to_string());
+    env
+}
+
+
+fn generate_python_tools(specs: &[crate::client_common::tools::ToolSpec]) -> String {
+    let mut code = String::from("import json\nimport sys\n\n");
+    code.push_str("def _call_tool(name, args):\n");
+    code.push_str("    print(f'<<TOOL_CALL>>{json.dumps({\"name\": name, \"args\": args})}<<END_TOOL_CALL>>', flush=True)\n");
+    code.push_str("    line = sys.stdin.readline()\n");
+    code.push_str("    if '<<TOOL_RESULT>>' in line:\n");
+    code.push_str("        start = line.find('<<TOOL_RESULT>>') + 15\n");
+    code.push_str("        end = line.find('<<END_TOOL_RESULT>>')\n");
+    code.push_str("        content = line[start:end]\n");
+    code.push_str("        try:\n");
+    code.push_str("            return json.loads(content)\n");
+    code.push_str("        except json.JSONDecodeError:\n");
+    code.push_str("            return content\n");
+    code.push_str("    return None\n\n");
+
+    for spec in specs {
+        let name = spec.name().to_string();
+        code.push_str(&format!(
+            "def {name}(**kwargs):\n    return _call_tool('{name}', kwargs)\n\n"
+        ));
+    }
+    code
 }
