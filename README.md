@@ -32,6 +32,43 @@ We believe in a **native-first approach**. By building a dedicated adapter that 
 - **Robust Function Calling**: Correctly handles parallel tool calls, history coalescing, and schema sanitization to ensure high reliability.
 - **Direct API Client**: A dedicated async client supporting both SSE (streaming) and standard JSON transports.
 
+## Features
+
+### Programmatic Tool Calling (Unified Exec)
+
+**Why we did this**:
+Standard agent interactions often require multiple round-trips to perform complex tasks. For example, if the model needs to query a list of users, filter them based on some logic, and then fetch details for the filtered users, it would typically need to:
+
+1. Call a tool to get users.
+2. Wait for the response.
+3. Process the list internally (consuming tokens).
+4. Call another tool for each user.
+
+This "chatty" protocol is slow and expensive. Programmatic Tool Calling allows the model to write a small script (e.g., Python) that executes these steps in a single turn, running locally within the agent's environment.
+
+**How is it implemented**:
+The feature is built on top of the `unified_exec` runtime.
+
+1. **Helper Injection**: When a `unified_exec` session starts, the agent injects a `codex_tools.py` module into the environment. This module contains Python stubs for all tools registered with the agent (e.g., `shell`, `web_search`, etc.).
+2. **IPC Protocol**: These stubs do not execute the tools directly. Instead, they print a special IPC message to stdout: `<<TOOL_CALL>>{...}<<END_TOOL_CALL>>`.
+3. **Interception**: The `UnifiedExecSessionManager` monitors the process output. When it detects this pattern, it pauses the process, parses the tool request, and executes the actual tool (which might be a Rust function or an MCP tool).
+4. **Result Injection**: The result is serialized and written back to the process's stdin using `<<TOOL_RESULT>>...<<END_TOOL_RESULT>>`. The Python stub reads this result and returns it to the script as a native object.
+
+**How to use it**:
+The model can generate a Python script that imports `codex_tools` and calls available tools as functions.
+
+```python
+import codex_tools
+import json
+
+# Example: Using the shell tool programmatically
+# The 'command' argument must match the tool's schema
+result = codex_tools.shell(command=["echo", "Hello from subtool"])
+print(f"Tool returned: {result}")
+```
+
+Enable this feature by setting `experimental_use_unified_exec_tool = true` in your `config.toml` or passing `--enable unified_exec`.
+
 ## Gemini Differences & Technical Implementation
 
 This project implements several key technical differentiators to support Gemini:

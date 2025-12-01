@@ -3,5 +3,8 @@ source: tui/src/history_cell.rs
 expression: rendered
 ---
 • Updated Plan
-  └ □ Define error taxonomy
+  └ Hypothesis: Errors mapped incorrectly
+    Gap: Need taxonomy coverage info
+  └ □ Define error taxonomy [read_file]
     □ Implement mapping to user messages
+      [apply_patch]

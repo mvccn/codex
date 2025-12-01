@@ -60,7 +60,7 @@ async fn model_selects_expected_tools() {
             "update_plan".to_string(),
             "view_image".to_string()
         ],
-        "codex-mini-latest should expose the local shell tool",
+        "codex-mini-latest should expose the local shell tool set",
     );
 
     let gpt5_codex_tools = collect_tool_identifiers_for_model("gpt-5-codex").await;

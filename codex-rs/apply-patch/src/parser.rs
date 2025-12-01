@@ -211,9 +211,10 @@ fn normalize_patch_input(patch: &str, mode: ParseMode) -> Result<String, ParseEr
     }
 
     if let Some(first) = lines.first_mut()
-        && first.trim() != BEGIN_PATCH_MARKER {
-            *first = BEGIN_PATCH_MARKER.to_string();
-        }
+        && first.trim() != BEGIN_PATCH_MARKER
+    {
+        *first = BEGIN_PATCH_MARKER.to_string();
+    }
 
     match lines
         .iter()
@@ -230,9 +231,10 @@ fn normalize_patch_input(patch: &str, mode: ParseMode) -> Result<String, ParseEr
     }
 
     if let Some(last) = lines.last_mut()
-        && last.trim() != END_PATCH_MARKER {
-            *last = END_PATCH_MARKER.to_string();
-        }
+        && last.trim() != END_PATCH_MARKER
+    {
+        *last = END_PATCH_MARKER.to_string();
+    }
 
     Ok(lines.join("\n"))
 }

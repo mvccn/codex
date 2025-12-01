@@ -1,9 +1,12 @@
+use crate::client_common::tools::ToolSpec;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::function_tool::FunctionCallError;
 use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use async_trait::async_trait;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
@@ -12,6 +15,16 @@ use codex_utils_string::take_bytes_at_char_boundary;
 use mcp_types::CallToolResult;
 use std::borrow::Cow;
 use std::sync::Arc;
+
+#[async_trait]
+pub trait ToolDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<ResponseInputItem, FunctionCallError>;
+
+    fn specs(&self) -> Vec<ToolSpec>;
+}
 use tokio::sync::Mutex;
 
 pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
@@ -24,6 +37,7 @@ pub struct ToolInvocation {
     pub call_id: String,
     pub tool_name: String,
     pub payload: ToolPayload,
+    pub dispatcher: Arc<dyn ToolDispatcher>,
 }
 
 #[derive(Clone)]

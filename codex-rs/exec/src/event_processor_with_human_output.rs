@@ -508,7 +508,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 eprintln!();
             }
             EventMsg::PlanUpdate(plan_update_event) => {
-                let UpdatePlanArgs { explanation, plan } = plan_update_event;
+                let UpdatePlanArgs {
+                    action_plan,
+                    explanation,
+                } = plan_update_event;
 
                 // Header
                 ts_msg!(self, "{}", "Plan update".style(self.magenta));
@@ -521,20 +524,33 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
 
                 // Pretty-print the plan items with simple status markers.
-                for item in plan {
+                for item in action_plan {
                     match item.status {
                         StepStatus::Completed => {
-                            ts_msg!(self, "  {} {}", "✓".style(self.green), item.step);
+                            ts_msg!(
+                                self,
+                                "  {} {} ({})",
+                                "✓".style(self.green),
+                                item.step,
+                                item.tool.style(self.dimmed)
+                            );
                         }
                         StepStatus::InProgress => {
-                            ts_msg!(self, "  {} {}", "→".style(self.cyan), item.step);
+                            ts_msg!(
+                                self,
+                                "  {} {} ({})",
+                                "→".style(self.cyan),
+                                item.step,
+                                item.tool.style(self.dimmed)
+                            );
                         }
                         StepStatus::Pending => {
                             ts_msg!(
                                 self,
-                                "  {} {}",
+                                "  {} {} ({})",
                                 "•".style(self.dimmed),
-                                item.step.style(self.dimmed)
+                                item.step.style(self.dimmed),
+                                item.tool.style(self.dimmed)
                             );
                         }
                     }

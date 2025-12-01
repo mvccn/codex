@@ -275,15 +275,17 @@ pub fn maybe_parse_apply_patch_verified(argv: &[String], cwd: &Path) -> MaybeApp
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
     if let [body] = argv
-        && body.trim_start().starts_with(parser::BEGIN_PATCH_MARKER) && parse_patch(body).is_ok() {
-            return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
-        }
+        && body.trim_start().starts_with(parser::BEGIN_PATCH_MARKER)
+        && parse_patch(body).is_ok()
+    {
+        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
+    }
     if let Some((_, script)) = parse_shell_script(argv)
         && script.trim_start().starts_with(parser::BEGIN_PATCH_MARKER)
-            && parse_patch(script).is_ok()
-        {
-            return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
-        }
+        && parse_patch(script).is_ok()
+    {
+        return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
+    }
 
     match maybe_parse_apply_patch(argv) {
         MaybeApplyPatch::Body(ApplyPatchArgs {
@@ -800,7 +802,11 @@ fn compute_replacements(
             replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
             line_index = start_idx + pattern.len();
         } else {
-            return Err(ApplyPatchError::ComputeReplacements(describe_mismatch(path, original_lines, pattern)));
+            return Err(ApplyPatchError::ComputeReplacements(describe_mismatch(
+                path,
+                original_lines,
+                pattern,
+            )));
         }
     }
 

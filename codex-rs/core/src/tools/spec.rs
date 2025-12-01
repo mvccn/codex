@@ -72,6 +72,11 @@ impl ToolsConfig {
                 }
             }
         };
+        let apply_patch_tool_type = if model_family.family.starts_with("gpt-5") {
+            Some(ApplyPatchToolType::Freeform)
+        } else {
+            apply_patch_tool_type
+        };
 
         Self {
             shell_type,
@@ -1485,6 +1490,7 @@ mod tests {
                 "list_mcp_resource_templates",
                 "read_mcp_resource",
                 "update_plan",
+                "apply_patch",
                 "view_image",
             ],
         );

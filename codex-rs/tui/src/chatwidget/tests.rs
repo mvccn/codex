@@ -2637,21 +2637,26 @@ fn apply_patch_request_shows_diff_summary() {
 fn plan_update_renders_history_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     let update = UpdatePlanArgs {
-        explanation: Some("Adapting plan".to_string()),
-        plan: vec![
+        hypothesis: "Bug likely in parsing".to_string(),
+        information_gap: "Need failing input to confirm".to_string(),
+        action_plan: vec![
             PlanItemArg {
                 step: "Explore codebase".into(),
+                tool: "read_file".into(),
                 status: StepStatus::Completed,
             },
             PlanItemArg {
                 step: "Implement feature".into(),
+                tool: "apply_patch".into(),
                 status: StepStatus::InProgress,
             },
             PlanItemArg {
                 step: "Write tests".into(),
+                tool: "cargo test".into(),
                 status: StepStatus::Pending,
             },
         ],
+        explanation: Some("Adapting plan".to_string()),
     };
     chat.handle_codex_event(Event {
         id: "sub-1".into(),
@@ -2664,6 +2669,8 @@ fn plan_update_renders_history_cell() {
         blob.contains("Updated Plan"),
         "missing plan header: {blob:?}"
     );
+    assert!(blob.contains("Hypothesis"));
+    assert!(blob.contains("Gap"));
     assert!(blob.contains("Explore codebase"));
     assert!(blob.contains("Implement feature"));
     assert!(blob.contains("Write tests"));

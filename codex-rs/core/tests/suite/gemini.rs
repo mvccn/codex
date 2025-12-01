@@ -198,6 +198,11 @@ async fn gemini_non_streaming_round_trip_and_payload_shape() {
     let payload: Value = requests[0]
         .body_json()
         .expect("Gemini request body should be JSON");
+    // cachedContent must be absent unless we explicitly set a cache resource ID.
+    assert!(
+        payload.get("cachedContent").is_none(),
+        "cachedContent should be omitted when we are not reusing a cache entry"
+    );
     assert!(
         payload.get("contents").is_some(),
         "Gemini payload must contain contents: {payload:?}"
@@ -227,6 +232,11 @@ async fn gemini_non_streaming_round_trip_and_payload_shape() {
         thinking_config.get("thinkingLevel"),
         Some(&json!("HIGH")),
         "Gemini requests should propagate reasoning effort into thinking_level"
+    );
+
+    assert!(
+        payload.get("cachedContent").is_none(),
+        "cachedContent should be omitted when we are not reusing a cache entry"
     );
 }
 

@@ -394,7 +394,7 @@ impl EventProcessorWithJsonOutput {
     }
 
     fn todo_items_from_plan(&self, args: &UpdatePlanArgs) -> Vec<TodoItem> {
-        args.plan
+        args.action_plan
             .iter()
             .map(|p| TodoItem {
                 text: p.step.clone(),

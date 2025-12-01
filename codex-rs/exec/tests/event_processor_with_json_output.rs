@@ -139,17 +139,21 @@ fn plan_update_emits_todo_list_started_updated_and_completed() {
     let first = event(
         "p1",
         EventMsg::PlanUpdate(UpdatePlanArgs {
-            explanation: None,
-            plan: vec![
+            hypothesis: "bug occurs".to_string(),
+            information_gap: "need logs".to_string(),
+            action_plan: vec![
                 PlanItemArg {
                     step: "step one".to_string(),
+                    tool: "shell".to_string(),
                     status: StepStatus::Pending,
                 },
                 PlanItemArg {
                     step: "step two".to_string(),
+                    tool: "grep_files".to_string(),
                     status: StepStatus::InProgress,
                 },
             ],
+            explanation: None,
         }),
     );
     let out_first = ep.collect_thread_events(&first);
@@ -178,17 +182,21 @@ fn plan_update_emits_todo_list_started_updated_and_completed() {
     let second = event(
         "p2",
         EventMsg::PlanUpdate(UpdatePlanArgs {
-            explanation: None,
-            plan: vec![
+            hypothesis: "bug occurs".to_string(),
+            information_gap: "need logs".to_string(),
+            action_plan: vec![
                 PlanItemArg {
                     step: "step one".to_string(),
+                    tool: "shell".to_string(),
                     status: StepStatus::Completed,
                 },
                 PlanItemArg {
                     step: "step two".to_string(),
+                    tool: "grep_files".to_string(),
                     status: StepStatus::InProgress,
                 },
             ],
+            explanation: None,
         }),
     );
     let out_second = ep.collect_thread_events(&second);
@@ -450,11 +458,14 @@ fn plan_update_after_complete_starts_new_todo_list_with_new_id() {
     let start = event(
         "t1",
         EventMsg::PlanUpdate(UpdatePlanArgs {
-            explanation: None,
-            plan: vec![PlanItemArg {
+            hypothesis: "bug occurs".to_string(),
+            information_gap: "need logs".to_string(),
+            action_plan: vec![PlanItemArg {
                 step: "only".to_string(),
+                tool: "shell".to_string(),
                 status: StepStatus::Pending,
             }],
+            explanation: None,
         }),
     );
     let _ = ep.collect_thread_events(&start);
@@ -470,11 +481,14 @@ fn plan_update_after_complete_starts_new_todo_list_with_new_id() {
     let start_again = event(
         "t3",
         EventMsg::PlanUpdate(UpdatePlanArgs {
-            explanation: None,
-            plan: vec![PlanItemArg {
+            hypothesis: "bug occurs".to_string(),
+            information_gap: "need logs".to_string(),
+            action_plan: vec![PlanItemArg {
                 step: "again".to_string(),
+                tool: "shell".to_string(),
                 status: StepStatus::Pending,
             }],
+            explanation: None,
         }),
     );
     let out = ep.collect_thread_events(&start_again);

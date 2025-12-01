@@ -225,8 +225,6 @@ class Logger:
     config.model = "gemini-1.5-flash".to_string();
     config.approval_policy = codex_protocol::protocol::AskForApproval::Never;
     config.sandbox_policy = codex_protocol::protocol::SandboxPolicy::DangerFullAccess;
-    // Explicitly enable apply_patch
-    config.features.include_apply_patch_tool = Some(true);
 
     let auth_manager = Arc::new(AuthManager::new(
         config.codex_home.clone(),

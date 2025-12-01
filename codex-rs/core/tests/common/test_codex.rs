@@ -145,9 +145,12 @@ impl TestCodexBuilder {
             mutator(&mut config);
         }
 
-        if config.include_apply_patch_tool {
+        // Tests commonly rely on apply_patch for gpt-5; enable only for those families.
+        if config.model_family.family.starts_with("gpt-5") {
+            config.include_apply_patch_tool = true;
             config.features.enable(Feature::ApplyPatchFreeform);
         } else {
+            config.include_apply_patch_tool = false;
             config.features.disable(Feature::ApplyPatchFreeform);
         }
 

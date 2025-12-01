@@ -178,7 +178,7 @@ impl OpenAIDriver {
             let options = ApiResponsesOptions {
                 reasoning: self.effort.map(|e| Reasoning {
                     effort: Some(e),
-                    summary: Some(self.summary.clone()),
+                    summary: Some(self.summary),
                 }),
                 include: vec![],
                 prompt_cache_key: None,

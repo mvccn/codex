@@ -8,6 +8,9 @@ pub struct GenerateContentRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<ToolConfig>,
+    /// Optional cached content resource name to reuse (cachedContents/{id}).
+    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<String>,
     #[serde(rename = "generationConfig")]
     pub generation_config: Option<GenerationConfig>,
     #[serde(rename = "systemInstruction")]

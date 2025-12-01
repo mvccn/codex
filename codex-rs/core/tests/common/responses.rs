@@ -392,6 +392,17 @@ pub fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value {
     })
 }
 
+pub fn ev_function_call_output(call_id: &str, output: &str) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output
+        }
+    })
+}
+
 pub fn ev_custom_tool_call(call_id: &str, name: &str, input: &str) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",

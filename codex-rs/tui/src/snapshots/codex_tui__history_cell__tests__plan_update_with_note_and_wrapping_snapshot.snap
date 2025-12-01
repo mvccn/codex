@@ -3,6 +3,8 @@ source: tui/src/history_cell.rs
 expression: rendered
 ---
 • Updated Plan
+  └ Hypothesis: Grafana errors may stem from retries not firing
+    Gap: Need to confirm error paths and retry behavior
   └ I’ll update Grafana call
     error handling by adding
     retries and clearer
@@ -10,11 +12,12 @@ expression: rendered
     unreachable.
     ✔ Investigate existing error
       paths and logging around
-      HTTP timeouts
+      HTTP timeouts [read_file]
     □ Harden Grafana client
       error handling with retry/
       backoff and user‑friendly
-      messages
+      messages [apply_patch]
     □ Add tests for transient
       failure scenarios and
-      surfacing to the UI
+      surfacing to the UI [cargo
+      test]

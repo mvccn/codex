@@ -160,6 +160,9 @@ fn build_gemini_request(
         contents,
         tools,
         tool_config: None,
+        // Gemini generateContent expects cachedContent to be a resource name string
+        // (cachedContents/{id}); we do not create cache entries here.
+        cached_content: None,
         generation_config,
         system_instruction,
     })

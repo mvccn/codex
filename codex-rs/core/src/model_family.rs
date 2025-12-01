@@ -125,6 +125,7 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             slug, "codex-mini-latest",
             supports_reasoning_summaries: true,
             needs_special_apply_patch_instructions: true,
+            apply_patch_tool_type: None,
             shell_type: ConfigShellToolType::Local,
         )
     } else if slug.starts_with("gpt-4.1") {
@@ -234,6 +235,7 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             slug, "gpt-5",
             supports_reasoning_summaries: true,
             needs_special_apply_patch_instructions: true,
+            apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
             shell_type: ConfigShellToolType::Default,
             support_verbosity: true,
             truncation_policy: TruncationPolicy::Bytes(10_000),
@@ -243,6 +245,7 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             slug, "gemini",
             base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
             default_reasoning_effort: Some(ReasoningEffort::Medium),
+            supports_parallel_tool_calls: true,
         )
     } else {
         None

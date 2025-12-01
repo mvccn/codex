@@ -1260,8 +1260,14 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
 
 /// Render a user‑friendly plan update styled like a checkbox todo list.
 pub(crate) fn new_plan_update(update: UpdatePlanArgs) -> PlanUpdateCell {
-    let UpdatePlanArgs { explanation, plan } = update;
-    PlanUpdateCell { explanation, plan }
+    let UpdatePlanArgs {
+        action_plan,
+        explanation,
+    } = update;
+    PlanUpdateCell {
+        explanation,
+        plan: action_plan,
+    }
 }
 
 #[derive(Debug)]
@@ -1314,8 +1320,9 @@ impl HistoryCell for PlanUpdateCell {
         if self.plan.is_empty() {
             indented_lines.push(Line::from("(no steps provided)".dim().italic()));
         } else {
-            for PlanItemArg { step, status } in self.plan.iter() {
-                indented_lines.extend(render_step(status, step));
+            for PlanItemArg { step, tool, status } in self.plan.iter() {
+                let step_text = format!("{step} [{tool}]");
+                indented_lines.extend(render_step(status, &step_text));
             }
         }
         lines.extend(prefix_lines(indented_lines, "  └ ".dim(), "    ".into()));
@@ -2230,17 +2237,20 @@ mod tests {
                 "I’ll update Grafana call error handling by adding retries and clearer messages when the backend is unreachable."
                     .to_string(),
             ),
-            plan: vec![
+            action_plan: vec![
                 PlanItemArg {
                     step: "Investigate existing error paths and logging around HTTP timeouts".into(),
+                    tool: "read_file".into(),
                     status: StepStatus::Completed,
                 },
                 PlanItemArg {
                     step: "Harden Grafana client error handling with retry/backoff and user‑friendly messages".into(),
+                    tool: "apply_patch".into(),
                     status: StepStatus::InProgress,
                 },
                 PlanItemArg {
                     step: "Add tests for transient failure scenarios and surfacing to the UI".into(),
+                    tool: "cargo test".into(),
                     status: StepStatus::Pending,
                 },
             ],
@@ -2257,13 +2267,15 @@ mod tests {
     fn plan_update_without_note_snapshot() {
         let update = UpdatePlanArgs {
             explanation: None,
-            plan: vec![
+            action_plan: vec![
                 PlanItemArg {
                     step: "Define error taxonomy".into(),
+                    tool: "read_file".into(),
                     status: StepStatus::InProgress,
                 },
                 PlanItemArg {
                     step: "Implement mapping to user messages".into(),
+                    tool: "apply_patch".into(),
                     status: StepStatus::Pending,
                 },
             ],

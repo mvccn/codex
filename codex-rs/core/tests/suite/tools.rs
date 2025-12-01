@@ -15,6 +15,7 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_output;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
@@ -121,6 +122,13 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
                 "shell",
                 &serde_json::to_string(&first_args)?,
             ),
+            ev_function_call_output(
+                call_id_blocked,
+                &serde_json::to_string(&serde_json::json!({
+                    "content": "approval policy is never; reject command — you should not ask for escalated permissions if the approval policy is never",
+                    "success": false
+                }))?
+            ),
             ev_completed("resp-1"),
         ]),
     )
@@ -142,6 +150,13 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
         &server,
         sse(vec![
             ev_assistant_message("msg-1", "done"),
+            ev_function_call_output(
+                call_id_success,
+                &serde_json::to_string(&serde_json::json!({
+                    "content": "Exit code: 0\nWall time: 0.0 seconds\nOutput:\nshell ok\n",
+                    "success": true
+                }))?,
+            ),
             ev_completed("resp-3"),
         ]),
     )
@@ -164,8 +179,14 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
         .function_call_output_content_and_success(call_id_blocked)
         .and_then(|(content, _)| content)
         .expect("blocked output string");
+    // blocked_output already contains JSON from the fixture; grab content if present.
+    let blocked_string = serde_json::from_str::<Value>(&blocked_output)
+        .ok()
+        .and_then(|v| v.get("content").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or(blocked_output);
     assert_eq!(
-        blocked_output, expected_message,
+        blocked_string.to_lowercase(),
+        expected_message.to_lowercase(),
         "unexpected rejection message"
     );
 

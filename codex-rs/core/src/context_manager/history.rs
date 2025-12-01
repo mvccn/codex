@@ -75,6 +75,36 @@ impl ContextManager {
         history
     }
 
+    /// Returns the history split into a static prefix (eligible for caching)
+    /// and the remaining dynamic items. If nothing is considered static, the
+    /// prefix will be empty.
+    pub(crate) fn get_partitioned_history_for_prompt(
+        &mut self,
+    ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
+        let history = self.get_history_for_prompt();
+        let mut last_static_index: Option<usize> = None;
+        for (idx, item) in history.iter().enumerate() {
+            if is_static_candidate(item) {
+                last_static_index = Some(idx);
+            }
+        }
+
+        let Some(last_idx) = last_static_index else {
+            return (Vec::new(), history);
+        };
+
+        let (static_prefix, dynamic_suffix) = history.split_at(last_idx.saturating_add(1));
+        let static_bytes: usize = static_prefix.iter().map(estimate_item_len).sum();
+
+        // Avoid creating tiny caches; only treat the prefix as static when it
+        // is large enough to matter (e.g., big file contents or search indices).
+        if static_bytes < MIN_STATIC_PREFIX_BYTES {
+            return (Vec::new(), history);
+        }
+
+        (static_prefix.to_vec(), dynamic_suffix.to_vec())
+    }
+
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse lower bound, not a tokenizer-accurate count.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
@@ -260,6 +290,57 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
         .checked_div(4)
         .unwrap_or(0)
         .saturating_sub(650)
+}
+
+const MIN_STATIC_PREFIX_BYTES: usize = 2_048;
+const STATIC_TEXT_LEN_THRESHOLD: usize = 4_000;
+
+fn is_static_candidate(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => content.iter().any(content_item_is_static),
+        ResponseItem::FunctionCallOutput { output, .. } => {
+            output
+                .content_items
+                .as_ref()
+                .map(|items| {
+                    items.iter().any(|item| {
+                        matches!(item, codex_protocol::models::FunctionCallOutputContentItem::InputText { text } if text.len() >= STATIC_TEXT_LEN_THRESHOLD)
+                    })
+                })
+                .unwrap_or_else(|| output.content.len() >= STATIC_TEXT_LEN_THRESHOLD)
+        }
+        ResponseItem::CustomToolCallOutput { output, .. } => output.len() >= STATIC_TEXT_LEN_THRESHOLD,
+        _ => false,
+    }
+}
+
+fn content_item_is_static(item: &codex_protocol::models::ContentItem) -> bool {
+    use codex_protocol::models::ContentItem::*;
+    match item {
+        InputText { text } | OutputText { text } => {
+            is_instruction_text(text)
+                || text.contains(codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG)
+                || text.len() >= STATIC_TEXT_LEN_THRESHOLD
+        }
+        InputImage { .. } => false,
+    }
+}
+
+fn is_instruction_text(text: &str) -> bool {
+    text.starts_with(crate::user_instructions::USER_INSTRUCTIONS_PREFIX)
+}
+
+fn estimate_item_len(item: &ResponseItem) -> usize {
+    match item {
+        ResponseItem::Reasoning {
+            encrypted_content: Some(content),
+            ..
+        }
+        | ResponseItem::CompactionSummary {
+            encrypted_content: content,
+        } => estimate_reasoning_length(content.len()),
+        _ => serde_json::to_string(item).map(|s| s.len()).unwrap_or(0),
+    }
 }
 
 #[cfg(test)]

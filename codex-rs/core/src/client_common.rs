@@ -85,6 +85,15 @@ impl Prompt {
 
         input
     }
+
+    pub(crate) fn partition_history_for_cache(&self) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
+        let mut manager = crate::context_manager::ContextManager::new();
+        manager.record_items(
+            self.input.iter(),
+            crate::truncate::TruncationPolicy::Bytes(usize::MAX),
+        );
+        manager.get_partitioned_history_for_prompt()
+    }
 }
 
 fn reserialize_shell_outputs(items: &mut [ResponseItem]) {

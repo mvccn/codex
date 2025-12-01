@@ -37,6 +37,7 @@ pub trait ToolHandler: Send + Sync {
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError>;
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     handlers: HashMap<String, Arc<dyn ToolHandler>>,
 }
@@ -158,6 +159,7 @@ impl ConfiguredToolSpec {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolRegistryBuilder {
     handlers: HashMap<String, Arc<dyn ToolHandler>>,
     specs: Vec<ConfiguredToolSpec>,

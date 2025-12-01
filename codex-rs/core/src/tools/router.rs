@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolDispatcher;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ConfiguredToolSpec;
@@ -24,9 +26,24 @@ pub struct ToolCall {
     pub payload: ToolPayload,
 }
 
+#[derive(Clone)]
 pub struct ToolRouter {
     registry: ToolRegistry,
     specs: Vec<ConfiguredToolSpec>,
+}
+
+#[async_trait]
+impl ToolDispatcher for ToolRouter {
+    async fn dispatch(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<ResponseInputItem, FunctionCallError> {
+        self.registry.dispatch(invocation).await
+    }
+
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.specs()
+    }
 }
 
 impl ToolRouter {
@@ -151,8 +168,8 @@ impl ToolRouter {
             call_id,
             tool_name,
             payload,
+            dispatcher: Arc::new(self.clone()),
         };
-
         match self.registry.dispatch(invocation).await {
             Ok(response) => Ok(response),
             Err(FunctionCallError::Fatal(message)) => Err(FunctionCallError::Fatal(message)),

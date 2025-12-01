@@ -578,6 +578,7 @@ mod tests {
                 content: "ok".into(),
                 ..Default::default()
             },
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&item)?;
@@ -597,6 +598,7 @@ mod tests {
                 success: Some(false),
                 ..Default::default()
             },
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&item)?;
@@ -644,6 +646,7 @@ mod tests {
         let item = ResponseInputItem::FunctionCallOutput {
             call_id: "call1".into(),
             output: payload,
+            thought_signature: None,
         };
 
         let json = serde_json::to_string(&item)?;
