@@ -368,12 +368,12 @@ impl SessionConfiguration {
                 && (next_configuration.model.starts_with("gpt-")
                     || next_configuration.model.starts_with("o1-"))
             {
-                if let Some(provider) = self
-                    .original_config_do_not_use
-                    .model_providers
-                    .get("openai")
-                {
-                    next_configuration.provider_id = "openai".to_string();
+                // Try to find a suitable OpenAI provider entry (key, value).
+                let provider_entry = self.original_config_do_not_use.model_providers.get_key_value("openai")
+                    .or_else(|| self.original_config_do_not_use.model_providers.iter().find(|(_, p)| matches!(p.wire_api, WireApi::Responses | WireApi::Chat)));
+
+                if let Some((id, provider)) = provider_entry {
+                    next_configuration.provider_id = id.clone();
                     next_configuration.provider = provider.clone();
                 }
             }
@@ -3205,6 +3205,14 @@ mod tests {
                 session: Arc::clone(&session),
                 turn: Arc::clone(&turn_context),
                 tracker: Arc::clone(&turn_diff_tracker),
+                dispatcher: Arc::new(crate::tools::ToolRouter::from_config(
+                    &ToolsConfig::new(&ToolsConfigParams {
+                        model_family: &crate::model_family::find_family_for_model("gpt-5.1-codex")
+                            .expect("test model"),
+                        features: &crate::features::Features::with_defaults(),
+                    }),
+                    None,
+                )),
                 call_id,
                 tool_name: tool_name.to_string(),
                 payload: ToolPayload::Function {
@@ -3242,6 +3250,14 @@ mod tests {
                 session: Arc::clone(&session),
                 turn: Arc::clone(&turn_context),
                 tracker: Arc::clone(&turn_diff_tracker),
+                dispatcher: Arc::new(crate::tools::ToolRouter::from_config(
+                    &ToolsConfig::new(&ToolsConfigParams {
+                        model_family: &crate::model_family::find_family_for_model("gpt-5.1-codex")
+                            .expect("test model"),
+                        features: &crate::features::Features::with_defaults(),
+                    }),
+                    None,
+                )),
                 call_id: "test-call-2".to_string(),
                 tool_name: tool_name.to_string(),
                 payload: ToolPayload::Function {
@@ -3296,6 +3312,14 @@ mod tests {
                 session: Arc::clone(&session),
                 turn: Arc::clone(&turn_context),
                 tracker: Arc::clone(&tracker),
+                dispatcher: Arc::new(crate::tools::ToolRouter::from_config(
+                    &ToolsConfig::new(&ToolsConfigParams {
+                        model_family: &crate::model_family::find_family_for_model("gpt-5.1-codex")
+                            .expect("test model"),
+                        features: &crate::features::Features::with_defaults(),
+                    }),
+                    None,
+                )),
                 call_id: "exec-call".to_string(),
                 tool_name: "exec_command".to_string(),
                 payload: ToolPayload::Function {
