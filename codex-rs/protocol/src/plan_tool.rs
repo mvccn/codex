@@ -16,6 +16,8 @@ pub enum StepStatus {
 #[serde(deny_unknown_fields)]
 pub struct PlanItemArg {
     pub step: String,
+    #[serde(default)]
+    pub tool: Option<String>,
     pub status: StepStatus,
 }
 
@@ -24,5 +26,6 @@ pub struct PlanItemArg {
 pub struct UpdatePlanArgs {
     #[serde(default)]
     pub explanation: Option<String>,
-    pub plan: Vec<PlanItemArg>,
+    #[serde(rename = "action_plan", alias = "plan")]
+    pub action_plan: Vec<PlanItemArg>,
 }

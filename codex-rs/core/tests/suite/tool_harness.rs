@@ -121,11 +121,11 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
 
     let call_id = "plan-tool-call";
     let plan_args = json!({
-        "explanation": "Tool harness check",
-        "plan": [
-            {"step": "Inspect workspace", "status": "in_progress"},
-            {"step": "Report results", "status": "pending"},
+        "action_plan": [
+            {"step": "Inspect workspace", "tool": "shell", "status": "in_progress"},
+            {"step": "Report results", "tool": "commentary", "status": "pending"},
         ],
+        "explanation": "Tool harness check",
     })
     .to_string();
 
@@ -164,11 +164,13 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
         EventMsg::PlanUpdate(update) => {
             saw_plan_update = true;
             assert_eq!(update.explanation.as_deref(), Some("Tool harness check"));
-            assert_eq!(update.plan.len(), 2);
-            assert_eq!(update.plan[0].step, "Inspect workspace");
-            assert_matches!(update.plan[0].status, StepStatus::InProgress);
-            assert_eq!(update.plan[1].step, "Report results");
-            assert_matches!(update.plan[1].status, StepStatus::Pending);
+            assert_eq!(update.action_plan.len(), 2);
+            assert_eq!(update.action_plan[0].step, "Inspect workspace");
+            assert_eq!(update.action_plan[0].tool.as_deref(), Some("shell"));
+            assert_matches!(update.action_plan[0].status, StepStatus::InProgress);
+            assert_eq!(update.action_plan[1].step, "Report results");
+            assert_eq!(update.action_plan[1].tool.as_deref(), Some("commentary"));
+            assert_matches!(update.action_plan[1].status, StepStatus::Pending);
             false
         }
         EventMsg::TaskComplete(_) => true,

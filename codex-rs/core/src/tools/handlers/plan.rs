@@ -18,20 +18,34 @@ use std::sync::LazyLock;
 pub struct PlanHandler;
 
 pub static PLAN_TOOL: LazyLock<ToolSpec> = LazyLock::new(|| {
-    let mut plan_item_props = BTreeMap::new();
-    plan_item_props.insert("step".to_string(), JsonSchema::String { description: None });
-    plan_item_props.insert(
+    let mut action_item_props = BTreeMap::new();
+    action_item_props.insert(
+        "step".to_string(),
+        JsonSchema::String {
+            description: Some("The specific step to take.".to_string()),
+        },
+    );
+    action_item_props.insert(
+        "tool".to_string(),
+        JsonSchema::String {
+            description: Some("Which tool to use for this step.".to_string()),
+        },
+    );
+    action_item_props.insert(
         "status".to_string(),
         JsonSchema::String {
             description: Some("One of: pending, in_progress, completed".to_string()),
         },
     );
 
-    let plan_items_schema = JsonSchema::Array {
-        description: Some("The list of steps".to_string()),
+    let action_plan_schema = JsonSchema::Array {
+        description: Some("Action steps with their intended tool and status".to_string()),
         items: Box::new(JsonSchema::Object {
-            properties: plan_item_props,
-            required: Some(vec!["step".to_string(), "status".to_string()]),
+            properties: action_item_props,
+            required: Some(vec![
+                "step".to_string(),
+                "status".to_string(),
+            ]),
             additional_properties: Some(false.into()),
         }),
     };
@@ -39,21 +53,23 @@ pub static PLAN_TOOL: LazyLock<ToolSpec> = LazyLock::new(|| {
     let mut properties = BTreeMap::new();
     properties.insert(
         "explanation".to_string(),
-        JsonSchema::String { description: None },
+        JsonSchema::String {
+            description: Some("Optional context or notes.".to_string()),
+        },
     );
-    properties.insert("plan".to_string(), plan_items_schema);
+    properties.insert("action_plan".to_string(), action_plan_schema.clone());
+    properties.insert("plan".to_string(), action_plan_schema);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: r#"Updates the task plan.
-Provide an optional explanation and a list of plan items, each with a step and status.
-At most one step can be in_progress at a time.
-"#
+        description: r#"Updates the task plan with structured thinking.
+Requires an action plan of steps with their tools and status.
+At most one step can be in_progress at a time."#
         .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["plan".to_string()]),
+            required: Some(vec!["action_plan".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
